@@ -21,7 +21,7 @@
 /* cover whichever is larger.                                          */
 /* ------------------------------------------------------------------ */
 __global__ static void beaver_cache_init_kernel(
-        gpu_shadow_holder_t *holders,
+        beaver_holder_t *holders,
         uint32_t            *hash_table,
         uint32_t             max_holders,
         uint32_t             hash_size,
@@ -30,7 +30,7 @@ __global__ static void beaver_cache_init_kernel(
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i < max_holders) {
-        gpu_shadow_holder_t *h = &holders[i];
+        beaver_holder_t *h = &holders[i];
         h->gpu_lock    = 0;
         h->cur         = -1;
         h->state       = HOLDER_INIT;
@@ -60,7 +60,7 @@ beaver_error_t beaver_cache_init(beaver_cache_t *cache, uint32_t max_holders)
     /* holders in pure device memory — GPU accesses at full bandwidth */
     cudaError_t cu;
     cu = cudaMalloc((void **)&cache->holders,
-                    max_holders * sizeof(gpu_shadow_holder_t));
+                    max_holders * sizeof(beaver_holder_t));
     if (cu != cudaSuccess) {
         fprintf(stderr, "beaver_cache_init: cudaMalloc(holders): %s\n",
                 cudaGetErrorString(cu));
@@ -145,4 +145,53 @@ beaver_error_t beaver_cache_cleanup(beaver_cache_t *cache)
     memset(cache, 0, sizeof(*cache));
 
     return BEAVER_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* beaver_log_init                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * beaver_log_init: allocate a PM circular buffer for the write-ahead log.
+ *
+ * The entry array is allocated via gpm_alloc (devdax, cudaHostRegister'd).
+ * The head and log_seq counters stay in DRAM (managed/device memory),
+ * since they do not need to survive a crash — recovery scans the PM
+ * entries by seq to rebuild holder state.
+ */
+int beaver_log_init(beaver_log_t *log, uint32_t capacity)
+{
+    if (!log || capacity == 0) return -1;
+
+    memset(log, 0, sizeof(*log));
+
+    size_t entries_sz = (size_t)capacity * sizeof(beaver_log_entry_t);
+    gpm_error_t gerr  = gpm_alloc(&log->pm_region, entries_sz, "beaver_log");
+    if (gerr != GPM_SUCCESS) {
+        fprintf(stderr, "beaver_log_init: gpm_alloc(%zu B) failed (%d)\n",
+                entries_sz, gerr);
+        return -1;
+    }
+
+    log->entries  = (beaver_log_entry_t *)log->pm_region.addr;
+    log->capacity = capacity;
+    log->head     = 0;
+    log->log_seq  = 0;
+
+    /* Zero all entries on PM so recovery sees no stale magic values */
+    pmem_memset_persist(log->entries, 0, entries_sz);
+
+    printf("beaver_log_init: %u entries (%.1f KiB PM) at %p\n",
+           capacity, (double)entries_sz / 1024.0, (void *)log->entries);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* beaver_log_cleanup                                                  */
+/* ------------------------------------------------------------------ */
+void beaver_log_cleanup(beaver_log_t *log)
+{
+    if (!log || !log->entries) return;
+    gpm_free(&log->pm_region);
+    memset(log, 0, sizeof(*log));
 }

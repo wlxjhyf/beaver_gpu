@@ -314,14 +314,16 @@ int main(int argc, char **argv)
     int exit_code = 1;
 
     /* ---- Declare all managed pointers up front ---- */
-    beaver_cache_t *cache  = NULL;
-    gpu_f2fs_t     *fs     = NULL;
-    gpu_vfs_t      *vfs    = NULL;   /* VFS handle — wraps fs */
-    test_results_t *res    = NULL;
+    beaver_cache_t *cache      = NULL;   /* inode COW cache (COW mode)    */
+    beaver_cache_t *data_cache = NULL;   /* data page COW cache (both modes) */
+    gpu_f2fs_t     *fs         = NULL;
+    gpu_vfs_t      *vfs        = NULL;
+    test_results_t *res        = NULL;
 
-    beaver_cache_t *cache5 = NULL;
-    gpu_f2fs_t     *fs5    = NULL;
-    gpu_vfs_t      *vfs5   = NULL;   /* VFS handle for T5 (checkpoint mode) */
+    beaver_cache_t *cache5      = NULL;
+    beaver_cache_t *data_cache5 = NULL;
+    gpu_f2fs_t     *fs5         = NULL;
+    gpu_vfs_t      *vfs5        = NULL;
 
     uint8_t  *t1_wbuf = NULL, *t1_rbuf = NULL;
     uint8_t  *t2_wbufs = NULL, *t2_rbufs = NULL;
@@ -333,21 +335,26 @@ int main(int argc, char **argv)
     uint32_t *d_t3hashes = NULL;
 
     /* ---- Allocate control structs in managed memory ---- */
-    CUDA_CHECK(cudaMallocManaged((void **)&cache, sizeof(beaver_cache_t)));
-    CUDA_CHECK(cudaMallocManaged((void **)&fs,    sizeof(gpu_f2fs_t)));
-    CUDA_CHECK(cudaMallocManaged((void **)&vfs,   sizeof(gpu_vfs_t)));
-    CUDA_CHECK(cudaMallocManaged((void **)&res,   sizeof(test_results_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&cache,      sizeof(beaver_cache_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&data_cache, sizeof(beaver_cache_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&fs,         sizeof(gpu_f2fs_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&vfs,        sizeof(gpu_vfs_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&res,        sizeof(test_results_t)));
     memset(res, 0, sizeof(test_results_t));
 
-    /* ---- Init COW cache (must come before gpu_f2fs_init) ---- */
+    /* ---- Init COW caches ---- */
     if (beaver_cache_init(cache, FS_MAX_INODES) != BEAVER_SUCCESS) {
-        fprintf(stderr, "beaver_cache_init failed\n");
+        fprintf(stderr, "beaver_cache_init(inode) failed\n");
+        goto cleanup_allocs;
+    }
+    if (beaver_cache_init(data_cache, FS_MAX_DATA_BLOCKS) != BEAVER_SUCCESS) {
+        fprintf(stderr, "beaver_cache_init(data) failed\n");
+        beaver_cache_cleanup(cache);
         goto cleanup_allocs;
     }
 
     /* ---- Init GPU F2FS in COW mode ---- */
-    if (gpu_f2fs_init(fs, cache, FS_MAX_INODES, FS_MAX_DATA_BLOCKS, 1)
-            != GPU_F2FS_OK) {
+    if (gpu_f2fs_init(fs, cache, data_cache, FS_MAX_INODES, 1) != GPU_F2FS_OK) {
         fprintf(stderr, "gpu_f2fs_init failed\n");
         goto cleanup_cache;
     }
@@ -488,12 +495,12 @@ int main(int argc, char **argv)
 
     /* ================================================================ */
     /* T4: PM persistence.
-     * T1 wrote file 0 (nid=0), page 0 → data block_addr=0.
-     *   data PM offset  = fs->pm_data_region.pm_offset + 0×PAGE_SIZE
-     *   inode PM offset = cache->pm_region.pm_offset + 0×3×PAGE_SIZE
-     *     (holder 0, pm_addrs[0] = pm_base + 0×3×PAGE = pm_base)       */
+     * T1 wrote file 0 (nid=0), page 0:
+     *   data → data_cache holder 0, pm_addrs[0] = data_cache->pm_base + 0
+     *   inode → cow_cache holder 0, pm_addrs[0] = cache->pm_base + 0
+     * inode.i_addr[0] = holder_idx = 0 (stored in holder, verifiable via PM) */
     {
-        size_t data_offset  = fs->pm_data_region.pm_offset;
+        size_t data_offset  = data_cache->pm_region.pm_offset;
         size_t inode_offset = cache->pm_region.pm_offset;
         run_t4(data_offset, inode_offset, T1_MAGIC, T1_NAME_HASH);
     }
@@ -504,17 +511,25 @@ int main(int argc, char **argv)
      * independent.  vfs5 type = GPU_FS_F2FS_PM, use_cow = 0.           */
     printf("\n=== [T5] Checkpoint mode: write→checkpoint→PM verify ===\n");
 
-    CUDA_CHECK(cudaMallocManaged((void **)&cache5, sizeof(beaver_cache_t)));
-    CUDA_CHECK(cudaMallocManaged((void **)&fs5,    sizeof(gpu_f2fs_t)));
-    CUDA_CHECK(cudaMallocManaged((void **)&vfs5,   sizeof(gpu_vfs_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&cache5,      sizeof(beaver_cache_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&data_cache5, sizeof(beaver_cache_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&fs5,         sizeof(gpu_f2fs_t)));
+    CUDA_CHECK(cudaMallocManaged((void **)&vfs5,        sizeof(gpu_vfs_t)));
 
+    /* In checkpoint mode cow_cache is not used for inode persistence,
+     * but data_cache is still required (data always goes through Beaver). */
     if (beaver_cache_init(cache5, FS_MAX_INODES) != BEAVER_SUCCESS) {
-        fprintf(stderr, "[T5] beaver_cache_init failed\n");
+        fprintf(stderr, "[T5] beaver_cache_init(inode) failed\n");
         goto cleanup_bufs;
     }
-    if (gpu_f2fs_init(fs5, cache5, FS_MAX_INODES, FS_MAX_DATA_BLOCKS, 0)
-            != GPU_F2FS_OK) {
+    if (beaver_cache_init(data_cache5, FS_MAX_DATA_BLOCKS) != BEAVER_SUCCESS) {
+        fprintf(stderr, "[T5] beaver_cache_init(data) failed\n");
+        beaver_cache_cleanup(cache5);
+        goto cleanup_bufs;
+    }
+    if (gpu_f2fs_init(fs5, cache5, data_cache5, FS_MAX_INODES, 0) != GPU_F2FS_OK) {
         fprintf(stderr, "[T5] gpu_f2fs_init failed\n");
+        beaver_cache_cleanup(data_cache5);
         beaver_cache_cleanup(cache5);
         goto cleanup_bufs;
     }
@@ -547,10 +562,12 @@ int main(int argc, char **argv)
     gpu_f2fs_do_checkpoint(fs5);
     printf("  checkpoint done.\n");
 
-    /* Verify PM: data at pm_data_region, inode at cache5 pm_region */
+    /* Verify PM:
+     *   data → data_cache5 holder 0, slot 0 = data_cache5->pm_region.pm_offset
+     *   inode → pm_inode_base (checkpoint pack) = fs5->pm_inode_region.pm_offset */
     {
-        size_t data5  = fs5->pm_data_region.pm_offset;
-        size_t inode5 = cache5->pm_region.pm_offset;
+        size_t data5  = data_cache5->pm_region.pm_offset;
+        size_t inode5 = fs5->pm_inode_region.pm_offset;
         run_t5_persist(data5, inode5, T5_MAGIC, T5_NAME_HASH);
     }
 
@@ -581,10 +598,12 @@ int main(int argc, char **argv)
     cudaFree(t5_wbuf); t5_wbuf = NULL;
     cudaFree(t5_rbuf); t5_rbuf = NULL;
     gpu_f2fs_cleanup(fs5);
+    beaver_cache_cleanup(data_cache5);
     beaver_cache_cleanup(cache5);
-    cudaFree(vfs5);   vfs5   = NULL;
-    cudaFree(fs5);    fs5    = NULL;
-    cudaFree(cache5); cache5 = NULL;
+    cudaFree(vfs5);        vfs5        = NULL;
+    cudaFree(fs5);         fs5         = NULL;
+    cudaFree(data_cache5); data_cache5 = NULL;
+    cudaFree(cache5);      cache5      = NULL;
 
 cleanup_bufs:
     if (d_t3hashes)  { cudaFree(d_t3hashes);  d_t3hashes  = NULL; }
@@ -601,12 +620,14 @@ cleanup_bufs:
     if (t5_rbuf)     { cudaFree(t5_rbuf);      t5_rbuf     = NULL; }
     gpu_f2fs_cleanup(fs);
 cleanup_cache:
+    if (data_cache) { beaver_cache_cleanup(data_cache); }
     beaver_cache_cleanup(cache);
 cleanup_allocs:
-    if (res)   { cudaFree(res);   res   = NULL; }
-    if (vfs)   { cudaFree(vfs);   vfs   = NULL; }
-    if (fs)    { cudaFree(fs);    fs    = NULL; }
-    if (cache) { cudaFree(cache); cache = NULL; }
+    if (res)        { cudaFree(res);        res        = NULL; }
+    if (vfs)        { cudaFree(vfs);        vfs        = NULL; }
+    if (fs)         { cudaFree(fs);         fs         = NULL; }
+    if (data_cache) { cudaFree(data_cache); data_cache = NULL; }
+    if (cache)      { cudaFree(cache);      cache      = NULL; }
 
     ddio_enable(gpu_bus);
     printf("DDIO restored.\n");

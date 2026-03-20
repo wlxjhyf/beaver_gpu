@@ -1,21 +1,15 @@
 /*
- * gpu_f2fs.cu — GPU F2FS: all __device__ and host implementations.
+ * gpu_f2fs.cu — GPU F2FS: pure file-system operations.
  *
- * This file contains every function body for the F2FS layer:
+ * This file contains only F2FS layer code — no Beaver mechanics.
+ * Beaver operations (beaver_inode_persist, beaver_data_write/read,
+ * holder init) live in beaver_f2fs.cu.
  *
- *   __device__ core ops  (_inode_cow_write, f2fs_inode_update,
- *                          f2fs_alloc_data_block, f2fs_write/read_data_block)
- *   __device__ POSIX ops (gpu_create, gpu_open, gpu_write, gpu_read,
- *                          gpu_close)
- *   __global__ kernels   (gpu_f2fs_init_kernel, gpu_f2fs_checkpoint_kernel,
- *                          _init_f2fs_ops_kernel)
- *   host functions       (gpu_f2fs_init, gpu_f2fs_cleanup,
- *                          gpu_f2fs_do_checkpoint, gpu_vfs_mount_f2fs)
+ * Data path: every write goes through beaver_data_write (COW holder).
+ * Inode path: COW mode → beaver_inode_persist; Ckpt mode → dirty_flags.
  *
- * Header files included here:
- *   gpu_f2fs.h        — struct definitions + all declarations (no impl)
- *   beaver_cow.h      — COW inline primitives (__forceinline__, stay in .h)
- *   gpm_interface.cuh — GPM inline primitives (__forceinline__, stay in .cuh)
+ * inode.i_addr[pgoff] stores the holder_idx in data_cache, NOT a raw
+ * PM block address.  F2FS_NULL_ADDR means the page has not been written.
  */
 
 #include "gpu_f2fs.h"
@@ -24,94 +18,31 @@
 #include <cuda_runtime.h>
 
 /* ================================================================== */
-/* __device__ core ops                                                 */
+/* F2FS inode ops                                                      */
 /* ================================================================== */
 
 /*
- * _inode_cow_write: copy inode_shadow[nid].inode to PM via COW holder.
- *
- * Uses gpu_holder_write_and_flip (gpm_memcpy_nodrain + gpu_holder_flip):
- * exactly one __threadfence_system() drain total.
- *
- * Caller must hold inode_shadow[nid].lock.
- * This function acquires/releases h->gpu_lock (serialises COW slot access).
- */
-__device__ void _inode_cow_write(gpu_f2fs_t *fs, uint32_t nid)
-{
-    gpu_shadow_holder_t *h = gpu_find_holder(fs->cow_cache, (uint64_t)nid);
-    if (!h) return;   /* pre-allocated at init; should never be NULL */
-
-    gpu_spin_lock(&h->gpu_lock);
-    gpu_holder_write_and_flip(h, &fs->inode_shadow[nid].inode);
-    gpu_spin_unlock(&h->gpu_lock);
-}
-
-/*
- * f2fs_inode_update: persist the inode (COW) or mark dirty (Checkpoint).
+ * f2fs_inode_update: persist the inode (Beaver COW) or mark dirty (Checkpoint).
+ * This is the seam between the F2FS layer and the consistency layer.
  * Caller must hold inode_shadow[nid].lock.
  */
- //这里存在数据浪费，dirty_flags是每个inode一个uint32_t，但实际上只用1 bit就够了。可以改成位图来节省空间。
 __device__ void f2fs_inode_update(gpu_f2fs_t *fs, uint32_t nid)
 {
     if (fs->use_cow)
-        _inode_cow_write(fs, nid);
+        beaver_inode_persist(fs, nid);
     else
         fs->dirty_flags[nid] = 1;
 }
 
-/*
- * f2fs_alloc_data_block: atomically claim the next free data block.
- * Returns block_addr on success, F2FS_NULL_ADDR if the data slab is full.
- */
- //相比于F2FS的2MB segment，PM的优势在于不用大粒度擦除，这其实是相对于F2FS的优化（不用修改，但备注保留）
-__device__ uint32_t f2fs_alloc_data_block(gpu_f2fs_t *fs)
-{
-    uint32_t addr = atomicAdd(&fs->seg_cursor, 1u);
-    if (addr >= fs->max_data_blocks) {
-        atomicSub(&fs->seg_cursor, 1u);
-        return F2FS_NULL_ADDR;
-    }
-    return addr;
-}
-
-/*
- * f2fs_write_data_block: out-of-place write src to PM at block_addr.
- * Uses gpm_memcpy (volatile stores + drain) for PM durability.
- */
-__device__ void f2fs_write_data_block(gpu_f2fs_t *fs, uint32_t block_addr,
-                                      const void *src)
-{
-    void *dst = (char *)fs->pm_data_base
-                + (size_t)block_addr * BEAVER_PAGE_SIZE;
-    gpm_memcpy(dst, src, BEAVER_PAGE_SIZE);
-}
-
-/*
- * f2fs_read_data_block: read PM page at block_addr into dst.
- * Uses volatile loads to bypass GPU L2 cache (DDIO is disabled).
- */
-__device__ void f2fs_read_data_block(gpu_f2fs_t *fs, uint32_t block_addr,
-                                     void *dst)
-{
-    const char *src = (const char *)fs->pm_data_base
-                      + (size_t)block_addr * BEAVER_PAGE_SIZE;
-    const volatile unsigned long long *s =
-        (const volatile unsigned long long *)src;
-    unsigned long long *d = (unsigned long long *)dst;
-    for (uint32_t i = 0; i < BEAVER_PAGE_SIZE / sizeof(unsigned long long); ++i)
-        d[i] = s[i];
-}
-
 /* ================================================================== */
-/* __device__ POSIX ops                                               */
+/* GPU F2FS POSIX ops                                                  */
 /* ================================================================== */
 
 /*
- * gpu_create: allocate a new inode for file identified by name_hash.
+ * gpu_f2fs_create: allocate a new inode, zero-init, insert into name_table.
  * Returns nid (fd) on success, -1 on full pool or full name_table.
  */
- //看上去inode（fs->inode_shadow）这些元数据是保持在显存上的，是提前划分好的，但理论上来说我们需要按需分配
-__device__ int gpu_create(gpu_f2fs_t *fs, uint32_t name_hash)
+__device__ int gpu_f2fs_create(gpu_f2fs_t *fs, uint32_t name_hash)
 {
     uint32_t nid = atomicAdd(&fs->inode_cursor, 1u);
     if (nid >= fs->max_inodes) {
@@ -126,7 +57,7 @@ __device__ int gpu_create(gpu_f2fs_t *fs, uint32_t name_hash)
     s->inode.i_gid       = 0;
     s->inode.i_blocks    = 0;
     s->inode.i_size      = 0;
-    s->inode.i_mode      = 0100644u;   /* regular file, rw-r--r-- */
+    s->inode.i_mode      = 0100644u;
     s->inode.i_advise    = 0;
     s->inode._pad0       = 0;
     for (uint32_t i = 0; i < F2FS_ADDRS_PER_INODE; ++i)
@@ -134,8 +65,8 @@ __device__ int gpu_create(gpu_f2fs_t *fs, uint32_t name_hash)
 
     fs->dirty_flags[nid] = 0;
 
-    /* Insert into name_table (CAS linear-probe) */
-    uint32_t slot = _f2fs_name_slot(name_hash, fs->name_table_size);
+    /* CAS linear-probe insert into name_table */
+    uint32_t slot = f2fs_name_slot(name_hash, fs->name_table_size);
     for (uint32_t i = 0; i < fs->name_table_size; ++i) {
         uint32_t old = atomicCAS(&fs->name_table[slot],
                                  F2FS_NAME_EMPTY, nid);
@@ -143,17 +74,16 @@ __device__ int gpu_create(gpu_f2fs_t *fs, uint32_t name_hash)
             return (int)nid;
         slot = (slot + 1) % fs->name_table_size;
     }
-    return -1;   /* name_table full */
+    return -1;
 }
 
 /*
- * gpu_open: look up file by name_hash.
- * Lock-free: reads name_table and inode_shadow.name_hash only.
- * Returns nid as fd on success, -1 if not found.
+ * gpu_f2fs_open: look up file by name_hash.
+ * Lock-free. Returns nid as fd on success, -1 if not found.
  */
-__device__ int gpu_open(gpu_f2fs_t *fs, uint32_t name_hash)
+__device__ int gpu_f2fs_open(gpu_f2fs_t *fs, uint32_t name_hash)
 {
-    uint32_t slot = _f2fs_name_slot(name_hash, fs->name_table_size);
+    uint32_t slot = f2fs_name_slot(name_hash, fs->name_table_size);
     for (uint32_t i = 0; i < fs->name_table_size; ++i) {
         uint32_t nid = fs->name_table[slot];
         if (nid == F2FS_NAME_EMPTY)
@@ -166,66 +96,73 @@ __device__ int gpu_open(gpu_f2fs_t *fs, uint32_t name_hash)
 }
 
 /*
- * gpu_write: write one 4 KiB page (pgoff) from src.
- * Out-of-place: every call allocates a new data block.
- * Returns 0 on success, -1 bad fd/pgoff, -2 data slab full.
+ * gpu_f2fs_write: write one 4 KiB page (pgoff) from src.
+ *
+ * Data goes through beaver_data_write (COW holder, PM log, single drain).
+ * i_addr[pgoff] is updated to hold the holder_idx in data_cache.
+ * Inode (i_size, i_blocks, i_addr) is persisted via f2fs_inode_update.
+ *
+ * Returns 0 on success, -1 bad fd/pgoff, -2 data_cache full.
  */
- //数据本就是out-of-place的，cow只对元数据作用，这样都在PM上对比性能可能不明显
-__device__ int gpu_write(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
-                         const void *src)
+__device__ int gpu_f2fs_write(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
+                               const void *src)
 {
     if (fd < 0 || (uint32_t)fd >= fs->max_inodes)
         return -1;
     if (pgoff >= F2FS_ADDRS_PER_INODE)
         return -1;
 
-    /* 1+2: allocate data block and write to PM */
-    uint32_t block_addr = f2fs_alloc_data_block(fs);
-    if (block_addr == F2FS_NULL_ADDR)
-        return -2;
-    f2fs_write_data_block(fs, block_addr, src);
-
-    /* 3-6: update inode under spinlock */
     f2fs_inode_shadow_t *s = &fs->inode_shadow[(uint32_t)fd];
-    gpu_spin_lock(&s->lock);
+    beaver_spin_lock(&s->lock);
 
-    s->inode.i_addr[pgoff] = block_addr;
-    s->inode.i_blocks++;
+    uint32_t existing = s->inode.i_addr[pgoff];   /* F2FS_NULL_ADDR or holder_idx */
+
+    uint32_t new_idx = beaver_data_write(fs, (uint32_t)fd, pgoff, existing, src);
+    if (new_idx == (uint32_t)F2FS_NULL_ADDR) {
+        beaver_spin_unlock(&s->lock);
+        return -2;   /* data_cache full */
+    }
+
+    /* Update inode metadata */
+    if (existing == (uint32_t)F2FS_NULL_ADDR) {
+        s->inode.i_addr[pgoff] = new_idx;
+        s->inode.i_blocks++;
+    }
     uint64_t new_end = ((uint64_t)pgoff + 1) * BEAVER_PAGE_SIZE;
     if (new_end > s->inode.i_size)
         s->inode.i_size = new_end;
 
-    f2fs_inode_update(fs, (uint32_t)fd);   /* COW→PM or mark dirty */
+    f2fs_inode_update(fs, (uint32_t)fd);
 
-    gpu_spin_unlock(&s->lock);
+    beaver_spin_unlock(&s->lock);
     return 0;
 }
 
 /*
- * gpu_read: read one 4 KiB page (pgoff) into dst.
- * Lock-free: reads block_addr from DRAM inode shadow, then fetches from PM.
- * Returns 0 on success, -1 bad fd/pgoff or page not yet written.
+ * gpu_f2fs_read: read one 4 KiB page (pgoff) into dst.
+ * Lock-free: reads holder_idx from DRAM inode shadow, then fetches
+ * from the Beaver data holder's current PM slot.
+ * Returns 0 on success, -1 on bad fd/pgoff or page not written.
  */
-__device__ int gpu_read(gpu_f2fs_t *fs, int fd, uint32_t pgoff, void *dst)
+__device__ int gpu_f2fs_read(gpu_f2fs_t *fs, int fd, uint32_t pgoff, void *dst)
 {
     if (fd < 0 || (uint32_t)fd >= fs->max_inodes)
         return -1;
     if (pgoff >= F2FS_ADDRS_PER_INODE)
         return -1;
 
-    uint32_t block_addr = fs->inode_shadow[(uint32_t)fd].inode.i_addr[pgoff];
-    if (block_addr == F2FS_NULL_ADDR)
+    uint32_t holder_idx = fs->inode_shadow[(uint32_t)fd].inode.i_addr[pgoff];
+    if (holder_idx == (uint32_t)F2FS_NULL_ADDR)
         return -1;
 
-    f2fs_read_data_block(fs, block_addr, dst);
-    return 0;
+    return beaver_data_read(fs, holder_idx, dst);
 }
 
 /*
- * gpu_close: release fd.
+ * gpu_f2fs_close: release fd.
  * No-op: fd is a stateless nid index; no ref-counting required.
  */
-__device__ void gpu_close(gpu_f2fs_t *fs, int fd)
+__device__ void gpu_f2fs_close(gpu_f2fs_t *fs, int fd)
 {
     (void)fs; (void)fd;
 }
@@ -236,17 +173,12 @@ __device__ void gpu_close(gpu_f2fs_t *fs, int fd)
 
 /*
  * gpu_f2fs_init_kernel: parallel zero-init of inode_shadow, dirty_flags,
- * name_table; pre-allocates one COW holder per inode (page_id = nid).
- * Launch with enough threads to cover max(max_inodes, name_table_size).
+ * name_table.  Pure F2FS — no Beaver.
  */
- //现在的做法是一个thread给一个inode，这似乎不合理。
- //1. 会导致warp内部的thread分散执行吗？
- //2. 这样文件的数目不就被规划好了吗？
 __global__ static void gpu_f2fs_init_kernel(
         f2fs_inode_shadow_t *inode_shadow,
         uint32_t            *dirty_flags,
         uint32_t            *name_table,
-        beaver_cache_t      *cow_cache,
         uint32_t             max_inodes,
         uint32_t             name_table_size)
 {
@@ -265,11 +197,7 @@ __global__ static void gpu_f2fs_init_kernel(
         s->inode._pad0       = 0;
         for (uint32_t j = 0; j < F2FS_ADDRS_PER_INODE; ++j)
             s->inode.i_addr[j] = F2FS_NULL_ADDR;
-
         dirty_flags[i] = 0;
-
-        /* Pre-allocate COW holder for inode i (page_id = i). */
-        gpu_holder_alloc(cow_cache, (uint64_t)i);
     }
 
     if (i < name_table_size)
@@ -277,8 +205,11 @@ __global__ static void gpu_f2fs_init_kernel(
 }
 
 /*
- * gpu_f2fs_checkpoint_kernel: one thread per inode; flushes dirty inodes
- * to their PM COW holders.  Equivalent to GoFS checkpoint stop-the-world.
+ * gpu_f2fs_checkpoint_kernel: Checkpoint mode inode flush.
+ *
+ * One thread per inode: writes dirty inode pages from DRAM (inode_shadow)
+ * to fixed PM slots (pm_inode_base + nid * PAGE_SIZE).
+ * Stop-the-world: all GPU threads stall until checkpoint completes.
  */
 __global__ static void gpu_f2fs_checkpoint_kernel(gpu_f2fs_t *fs)
 {
@@ -288,13 +219,8 @@ __global__ static void gpu_f2fs_checkpoint_kernel(gpu_f2fs_t *fs)
     if (!fs->dirty_flags[nid])
         return;
 
-    gpu_shadow_holder_t *h = gpu_find_holder(fs->cow_cache, (uint64_t)nid);
-    if (!h) return;
-
-    gpu_spin_lock(&h->gpu_lock);
-    gpu_holder_write_and_flip(h, &fs->inode_shadow[nid].inode);
-    gpu_spin_unlock(&h->gpu_lock);
-
+    void *dst = (char *)fs->pm_inode_base + (size_t)nid * BEAVER_PAGE_SIZE;
+    gpm_memcpy(dst, &fs->inode_shadow[nid].inode, BEAVER_PAGE_SIZE);
     fs->dirty_flags[nid] = 0;
 }
 
@@ -302,27 +228,31 @@ __global__ static void gpu_f2fs_checkpoint_kernel(gpu_f2fs_t *fs)
 /* Host functions                                                      */
 /* ================================================================== */
 
-gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t *fs, beaver_cache_t *cow_cache,
-                              uint32_t max_inodes, uint32_t max_data_blocks,
-                              uint32_t use_cow)
+gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t     *fs,
+                              beaver_cache_t *cow_cache,
+                              beaver_cache_t *data_cache,
+                              uint32_t        max_inodes,
+                              uint32_t        use_cow)
 {
-    if (!fs || !cow_cache || max_inodes == 0 || max_data_blocks == 0)
+    if (!fs || max_inodes == 0 || !data_cache)
         return GPU_F2FS_ERR_INIT;
-    if (cow_cache->max_holders < max_inodes) {
-        fprintf(stderr,
-                "gpu_f2fs_init: cow_cache max_holders (%u) < max_inodes (%u)\n",
-                cow_cache->max_holders, max_inodes);
-        return GPU_F2FS_ERR_INIT;
+
+    if (use_cow) {
+        if (!cow_cache || cow_cache->max_holders < max_inodes) {
+            fprintf(stderr,
+                    "gpu_f2fs_init: COW mode requires cow_cache with "
+                    "max_holders >= max_inodes (%u)\n", max_inodes);
+            return GPU_F2FS_ERR_INIT;
+        }
     }
 
     memset(fs, 0, sizeof(*fs));
-    fs->cow_cache        = cow_cache;
-    fs->max_inodes       = max_inodes;
-    fs->max_data_blocks  = max_data_blocks;
-    fs->name_table_size  = max_inodes * 2;   /* ~50% load factor */
-    fs->use_cow          = use_cow;
-    fs->inode_cursor     = 0;
-    fs->seg_cursor       = 0;
+    fs->cow_cache       = cow_cache;
+    fs->data_cache      = data_cache;
+    fs->max_inodes      = max_inodes;
+    fs->name_table_size = max_inodes * 2;
+    fs->use_cow         = use_cow;
+    fs->inode_cursor    = 0;
 
     cudaError_t cu;
 
@@ -338,14 +268,22 @@ gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t *fs, beaver_cache_t *cow_cache,
                     fs->name_table_size * sizeof(uint32_t));
     if (cu != cudaSuccess) goto err_nametable;
 
-    {
-        size_t data_sz = (size_t)max_data_blocks * BEAVER_PAGE_SIZE;
-        if (gpm_alloc(&fs->pm_data_region, data_sz, "f2fs_data") != GPM_SUCCESS) {
-            fprintf(stderr, "gpu_f2fs_init: gpm_alloc(%zu MiB) failed\n",
-                    data_sz >> 20);
-            goto err_pmdata;
+    /* Checkpoint mode: allocate a flat PM inode area (no Beaver COW) */
+    if (!use_cow) {
+        size_t inode_pm_sz = (size_t)max_inodes * BEAVER_PAGE_SIZE;
+        if (gpm_alloc(&fs->pm_inode_region, inode_pm_sz, "f2fs_inode") != GPM_SUCCESS) {
+            fprintf(stderr,
+                    "gpu_f2fs_init: gpm_alloc(inode PM, %zu MiB) failed\n",
+                    inode_pm_sz >> 20);
+            goto err_pminode;
         }
-        fs->pm_data_base = fs->pm_data_region.addr;
+        fs->pm_inode_base = fs->pm_inode_region.addr;
+    }
+
+    /* PM write-ahead log */
+    if (beaver_log_init(&fs->log, BEAVER_LOG_CAP_DEFAULT) != 0) {
+        fprintf(stderr, "gpu_f2fs_init: beaver_log_init failed\n");
+        goto err_log;
     }
 
     {
@@ -356,7 +294,10 @@ gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t *fs, beaver_cache_t *cow_cache,
 
         gpu_f2fs_init_kernel<<<blocks, threads>>>(
                 fs->inode_shadow, fs->dirty_flags, fs->name_table,
-                cow_cache, max_inodes, fs->name_table_size);
+                max_inodes, fs->name_table_size);
+
+        if (use_cow)
+            beaver_f2fs_init_holders(cow_cache, max_inodes);
 
         cu = cudaDeviceSynchronize();
         if (cu != cudaSuccess) {
@@ -367,18 +308,18 @@ gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t *fs, beaver_cache_t *cow_cache,
     }
 
     fs->is_initialized = 1;
-    printf("gpu_f2fs_init: %u inodes  %u data blocks  mode=%s\n"
-           "  inode_shadow=%p  pm_data=%p (%.1f MiB)\n",
-           max_inodes, max_data_blocks,
+    printf("gpu_f2fs_init: %u inodes  data_cache=%u holders  mode=%s\n"
+           "  inode_shadow=%p  log_entries=%p\n",
+           max_inodes, data_cache->max_holders,
            use_cow ? "COW" : "Checkpoint",
-           (void *)fs->inode_shadow,
-           fs->pm_data_base,
-           (double)((size_t)max_data_blocks * BEAVER_PAGE_SIZE) / (1024.0*1024.0));
+           (void *)fs->inode_shadow, (void *)fs->log.entries);
     return GPU_F2FS_OK;
 
 err_kernel:
-    gpm_free(&fs->pm_data_region);
-err_pmdata:
+    beaver_log_cleanup(&fs->log);
+err_log:
+    if (fs->pm_inode_base) gpm_free(&fs->pm_inode_region);
+err_pminode:
     cudaFree(fs->name_table);
 err_nametable:
     cudaFree(fs->dirty_flags);
@@ -395,7 +336,8 @@ gpu_f2fs_err_t gpu_f2fs_cleanup(gpu_f2fs_t *fs)
     if (!fs || !fs->is_initialized)
         return GPU_F2FS_ERR_INIT;
 
-    gpm_free(&fs->pm_data_region);
+    beaver_log_cleanup(&fs->log);
+    if (fs->pm_inode_base) gpm_free(&fs->pm_inode_region);
     cudaFree(fs->name_table);
     cudaFree(fs->dirty_flags);
     cudaFree(fs->inode_shadow);
@@ -421,12 +363,6 @@ void gpu_f2fs_do_checkpoint(gpu_f2fs_t *fs)
 /* VFS mount                                                           */
 /* ================================================================== */
 
-/*
- * gpu_vfs_mount_f2fs: bind a VFS handle to this F2FS-PM instance.
- *
- * vfs_* dispatch functions (gpu_f2fs.h) are __forceinline__ direct calls
- * resolved at device-link time — no runtime function pointer setup needed.
- */
 void gpu_vfs_mount_f2fs(gpu_vfs_t *vfs, gpu_f2fs_t *f2fs)
 {
     vfs->fs   = f2fs;

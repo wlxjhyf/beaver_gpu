@@ -1,0 +1,81 @@
+============================================================
+   beaver_gpu  Microbenchmark  (GoFS §4.1/4.2 aligned)
+============================================================
+GPU  : NVIDIA GeForce RTX 4090  (compute 8.9)
+PM   : /dev/dax1.0 (devdax/beaver)  /mnt/pmem0 (fsdax/Basic+cuFile)
+ddio: found NVIDIA GPU at 0000:86:00.0 (AD102 [GeForce RTX 4090])
+PCIe bus 0x86 — disabling DDIO
+
+ddio: DDIO disabled (GPU bus=0x86)
+gpm_init: device = NVIDIA GeForce RTX 4090 (compute 8.9)
+gpm_init: devdax base=0x7eeb00000000  total=496.1 GB  is_pmem=1
+[cuFile] driver open OK  max_device_cache=128 KB
+
+Workload parameters:
+  Threads        : 1, 64, 256, 1024, 4096, 16384, 65536
+  Data/thread    : 32 writes × 4096 B = 128 KiB
+  Metric         : aggregate write throughput (MB/s)
+  Basic timing   : cudaMemcpy-sync → last pwrite() return
+  cuFile timing  : first cuFileWrite → last cuFileWrite return
+  Beaver timing  : kernel launch → cudaDeviceSynchronize
+
+### SeqWrite ###
+  32 writes/thread × 4096 B  —  timing: task-start to task-complete
+  Threads      Basic(MB/s)  cuFile(MB/s)  Beaver(MB/s)
+  ----------  ------------  ------------  ------------
+gpm_alloc[cow]: 2097152 bytes at 0x7eeb00000000  offset=0  is_pmem=1
+beaver_cache_init: 32 holders, PM slab 0 MiB at 0x7eeb00000000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 2097152 bytes at 0x7eeb00200000  offset=2097152  is_pmem=1
+beaver_cache_init: 1 holders, PM slab 0 MiB at 0x7eeb00200000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eeb00400000  offset=4194304  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eeb00400000
+gpu_f2fs_init: 1 inodes  data_cache=32 holders  mode=COW
+  inode_shadow=0x7f6720e41e00  log_entries=0x7eeb00400000
+  1                  353.9        1101.5           6.8
+gpm_alloc[cow]: 25165824 bytes at 0x7eeb00600000  offset=6291456  is_pmem=1
+beaver_cache_init: 2048 holders, PM slab 24 MiB at 0x7eeb00600000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 2097152 bytes at 0x7eeb01e00000  offset=31457280  is_pmem=1
+beaver_cache_init: 64 holders, PM slab 0 MiB at 0x7eeb01e00000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eeb02000000  offset=33554432  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eeb02000000
+gpu_f2fs_init: 64 inodes  data_cache=2048 holders  mode=COW
+  inode_shadow=0x7f6720e62000  log_entries=0x7eeb02000000
+  64                1944.8        1588.8          44.1
+gpm_alloc[cow]: 100663296 bytes at 0x7eeb02200000  offset=35651584  is_pmem=1
+beaver_cache_init: 8192 holders, PM slab 96 MiB at 0x7eeb02200000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 4194304 bytes at 0x7eeb08200000  offset=136314880  is_pmem=1
+beaver_cache_init: 256 holders, PM slab 3 MiB at 0x7eeb08200000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eeb08600000  offset=140509184  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eeb08600000
+gpu_f2fs_init: 256 inodes  data_cache=8192 holders  mode=COW
+  inode_shadow=0x7f6720ec5000  log_entries=0x7eeb08600000
+  256               2241.8        1596.3          47.2
+gpm_alloc[cow]: 402653184 bytes at 0x7eeb08800000  offset=142606336  is_pmem=1
+beaver_cache_init: 32768 holders, PM slab 384 MiB at 0x7eeb08800000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 12582912 bytes at 0x7eeb20800000  offset=545259520  is_pmem=1
+beaver_cache_init: 1024 holders, PM slab 12 MiB at 0x7eeb20800000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eeb21400000  offset=557842432  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eeb21400000
+gpu_f2fs_init: 1024 inodes  data_cache=32768 holders  mode=COW
+  inode_shadow=0x7f6721200000  log_entries=0x7eeb21400000
+  1024              2228.9        1497.3          53.8
+gpm_alloc[cow]: 1610612736 bytes at 0x7eeb21600000  offset=559939584  is_pmem=1
+beaver_cache_init: 131072 holders, PM slab 1536 MiB at 0x7eeb21600000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 50331648 bytes at 0x7eeb81600000  offset=2170552320  is_pmem=1
+beaver_cache_init: 4096 holders, PM slab 48 MiB at 0x7eeb81600000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eeb84600000  offset=2220883968  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eeb84600000
+gpu_f2fs_init: 4096 inodes  data_cache=131072 holders  mode=COW
+  inode_shadow=0x7eeafe000000  log_entries=0x7eeb84600000
+  4096              2132.6        1504.0          53.1
+gpm_alloc[cow]: 6442450944 bytes at 0x7eeb84800000  offset=2222981120  is_pmem=1
+beaver_cache_init: 524288 holders, PM slab 6144 MiB at 0x7eeb84800000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[cow]: 201326592 bytes at 0x7eed04800000  offset=8665432064  is_pmem=1
+beaver_cache_init: 16384 holders, PM slab 192 MiB at 0x7eed04800000 (is_pmem=1)  holders/hash_table in GPU device memory
+gpm_alloc[beaver_log]: 2097152 bytes at 0x7eed10800000  offset=8866758656  is_pmem=1
+beaver_log_init: 4096 entries (128.0 KiB PM) at 0x7eed10800000
+gpu_f2fs_init: 16384 inodes  data_cache=524288 holders  mode=COW
+  inode_shadow=0x7eeaf2000000  log_entries=0x7eed10800000
+  16384             1216.9         680.4          50.3
+[Basic/Seq] pwrite: No space left on device
+[cuFile] cuFileWrite failed at i=30974: -1

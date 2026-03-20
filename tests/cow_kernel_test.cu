@@ -7,7 +7,7 @@
  *  T4 — Persistence: independent devdax remap
  *
  * holders and hash_table now live in cudaMalloc device memory.
- * Holder allocation is done via gpu_holder_alloc (device function) called
+ * Holder allocation is done via beaver_holder_alloc (device function) called
  * from a small setup kernel — the CPU never touches device memory directly.
  *
  * Run: sudo ./cow_kernel_test   (root needed for DDIO control)
@@ -64,15 +64,15 @@ typedef struct {
     } while (0)
 
 /* ------------------------------------------------------------------ */
-/* Setup kernel: allocate a holder via gpu_holder_alloc and write the */
+/* Setup kernel: allocate a holder via beaver_holder_alloc and write the */
 /* resulting device pointer into *out (a device-memory pointer cell). */
 /* ------------------------------------------------------------------ */
 __global__ void holder_alloc_kernel(beaver_cache_t       *cache,
                                     uint64_t              page_id,
-                                    gpu_shadow_holder_t **out)
+                                    beaver_holder_t **out)
 {
     if (blockIdx.x == 0 && threadIdx.x == 0)
-        *out = gpu_holder_alloc(cache, page_id);
+        *out = beaver_holder_alloc(cache, page_id);
 }
 
 /*
@@ -80,18 +80,18 @@ __global__ void holder_alloc_kernel(beaver_cache_t       *cache,
  * device pointer via cudaMemcpy.  The returned pointer is a device
  * address valid for passing to subsequent GPU kernels.
  */
-static gpu_shadow_holder_t *do_holder_alloc(beaver_cache_t *cache,
+static beaver_holder_t *do_holder_alloc(beaver_cache_t *cache,
                                             uint64_t        page_id)
 {
     /* Allocate a device cell to hold the returned pointer */
-    gpu_shadow_holder_t **d_out;
-    cudaMalloc((void **)&d_out, sizeof(gpu_shadow_holder_t *));
-    cudaMemset(d_out, 0, sizeof(gpu_shadow_holder_t *));
+    beaver_holder_t **d_out;
+    cudaMalloc((void **)&d_out, sizeof(beaver_holder_t *));
+    cudaMemset(d_out, 0, sizeof(beaver_holder_t *));
 
     holder_alloc_kernel<<<1, 1>>>(cache, page_id, d_out);
     cudaDeviceSynchronize();
 
-    gpu_shadow_holder_t *h = NULL;
+    beaver_holder_t *h = NULL;
     cudaMemcpy(&h, d_out, sizeof(h), cudaMemcpyDeviceToHost);
     cudaFree(d_out);
     return h;  /* device pointer */
@@ -100,7 +100,7 @@ static gpu_shadow_holder_t *do_holder_alloc(beaver_cache_t *cache,
 /* ------------------------------------------------------------------ */
 /* T1 kernel                                                           */
 /* ------------------------------------------------------------------ */
-__global__ void test_cow_t1_kernel(gpu_shadow_holder_t *h,
+__global__ void test_cow_t1_kernel(beaver_holder_t *h,
                                    beaver_cache_t      *cache,
                                    test_results_t      *res)
 {
@@ -108,19 +108,19 @@ __global__ void test_cow_t1_kernel(gpu_shadow_holder_t *h,
 
     if (h->cur != -1 || h->read_ptr != NULL) { res->t1_pass = 0; return; }
 
-    /* gpu_find_holder smoke test */
-    gpu_shadow_holder_t *found = gpu_find_holder(cache, h->page_id);
+    /* beaver_find_holder smoke test */
+    beaver_holder_t *found = beaver_find_holder(cache, h->page_id);
     res->find_pass = (found == h) ? 1u : 0u;
 
-    void *waddr = gpu_holder_write_addr(h);
+    void *waddr = beaver_holder_write_addr(h);
     if (waddr != h->pm_addrs[0]) { res->t1_pass = 0; return; }
 
     uint64_t magic = T1_MAGIC;
     gpm_memcpy(waddr, &magic, sizeof(magic));
-    gpu_holder_flip(h);
-    gpu_holder_commit(h);
+    beaver_holder_flip(h);
+    beaver_holder_commit(h);
 
-    void *rptr = gpu_holder_get_read(h);
+    void *rptr = beaver_holder_get_read(h);
     if (rptr != h->pm_addrs[0] || h->cur != 0) { res->t1_pass = 0; return; }
 
     volatile uint64_t *slot0 = (volatile uint64_t *)h->pm_addrs[0];
@@ -132,22 +132,22 @@ __global__ void test_cow_t1_kernel(gpu_shadow_holder_t *h,
 /* ------------------------------------------------------------------ */
 /* T2 kernel                                                           */
 /* ------------------------------------------------------------------ */
-__global__ void test_cow_t2_kernel(gpu_shadow_holder_t *h,
+__global__ void test_cow_t2_kernel(beaver_holder_t *h,
                                    test_results_t      *res)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     if (h->cur != 0) { res->t2_pass = 0; return; }
 
-    void *waddr = gpu_holder_write_addr(h);
+    void *waddr = beaver_holder_write_addr(h);
     if (waddr != h->pm_addrs[1]) { res->t2_pass = 0; return; }
 
     uint64_t magic2 = T2_MAGIC;
     gpm_memcpy(waddr, &magic2, sizeof(magic2));
-    gpu_holder_flip(h);
-    gpu_holder_commit(h);
+    beaver_holder_flip(h);
+    beaver_holder_commit(h);
 
-    void *rptr = gpu_holder_get_read(h);
+    void *rptr = beaver_holder_get_read(h);
     if (rptr != h->pm_addrs[1] || h->cur != 1) { res->t2_pass = 0; return; }
 
     volatile uint64_t *slot0 = (volatile uint64_t *)h->pm_addrs[0];
@@ -162,30 +162,30 @@ __global__ void test_cow_t2_kernel(gpu_shadow_holder_t *h,
 /* ------------------------------------------------------------------ */
 /* T3 kernel                                                           */
 /* ------------------------------------------------------------------ */
-__global__ void test_cow_t3_kernel(gpu_shadow_holder_t *h,
+__global__ void test_cow_t3_kernel(beaver_holder_t *h,
                                    test_results_t      *res)
 {
     uint32_t tid = threadIdx.x;
 
     if (tid == 0) {
-        void    *waddr = gpu_holder_write_addr(h);
+        void    *waddr = beaver_holder_write_addr(h);
         uint32_t val   = 0xABCD0000u;
         gpm_memcpy(waddr, &val, sizeof(val));
-        gpu_holder_flip(h);
+        beaver_holder_flip(h);
     }
     __syncthreads();
 
     for (int iter = 0; iter < T3_NUM_ITERS; ++iter) {
         if (tid == 0) {
-            void    *waddr = gpu_holder_write_addr(h);
+            void    *waddr = beaver_holder_write_addr(h);
             uint32_t val   = (uint32_t)iter;
             gpm_memcpy_nodrain(waddr, &val, sizeof(val));
-            gpu_holder_flip(h);
+            beaver_holder_flip(h);
             atomicAdd(&res->t3_iters_done, 1u);
         }
         __syncthreads();
 
-        void *rptr = gpu_holder_get_read(h);
+        void *rptr = beaver_holder_get_read(h);
         if (rptr == NULL)
             atomicAdd(&res->t3_null_count, 1u);
 
@@ -202,7 +202,7 @@ static int run_t4(size_t pm_offset)
 
     /* No CPU-side pmem_persist needed:
      *   - DDIO is disabled → GPU PCIe writes bypass CPU L3 cache entirely
-     *   - gpu_holder_commit already issued __threadfence_system() (gpm_persist)
+     *   - beaver_holder_commit already issued __threadfence_system() (gpm_persist)
      * CPU cache holds none of this data, so clwb/sfence would be no-ops.
      * The GPU drain is the only persist operation required. */
     printf("  pm_offset=0x%zx\n", pm_offset);
@@ -287,8 +287,8 @@ int main(int argc, char **argv)
     memset(res, 0, sizeof(test_results_t));
 
     /* ---- Allocate holders via GPU kernel (no CPU scanning) -------- */
-    gpu_shadow_holder_t *h_t1t2 = do_holder_alloc(cache, 42u);
-    gpu_shadow_holder_t *h_t3   = do_holder_alloc(cache, 99u);
+    beaver_holder_t *h_t1t2 = do_holder_alloc(cache, 42u);
+    beaver_holder_t *h_t3   = do_holder_alloc(cache, 99u);
 
     if (!h_t1t2 || !h_t3) {
         fprintf(stderr, "holder alloc failed\n");
@@ -305,9 +305,9 @@ int main(int argc, char **argv)
 
     {
         /* Read holder fields from device memory for display */
-        gpu_shadow_holder_t hl;
+        beaver_holder_t hl;
         cudaMemcpy(&hl, h_t1t2, sizeof(hl), cudaMemcpyDeviceToHost);
-        printf("  gpu_find_holder: %s\n",
+        printf("  beaver_find_holder: %s\n",
                res->find_pass ? "PASS (found correct holder)" : "FAIL");
         printf("  T1: %s  cur=%d  read_ptr=%p  pm_addrs[0]=%p\n",
                res->t1_pass ? "PASS" : "FAIL",
@@ -325,7 +325,7 @@ int main(int argc, char **argv)
     }
 
     {
-        gpu_shadow_holder_t hl;
+        beaver_holder_t hl;
         cudaMemcpy(&hl, h_t1t2, sizeof(hl), cudaMemcpyDeviceToHost);
         printf("  T2: %s  cur=%d  read_ptr=%p  pm_addrs[1]=%p\n",
                res->t2_pass ? "PASS" : "FAIL",
