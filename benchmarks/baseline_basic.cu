@@ -4,11 +4,16 @@
  *
  * Data path:
  *   GPU device memory  →  cudaMemcpy D→H  →  CPU pinned buffer
- *                      →  pwrite() to ext4-dax file  →  PM (/dev/pmem0)
+ *                      →  pwrite() to ext4-dax file
+ *                      →  fdatasync() (CLWB+SFENCE, flushes CPU cache → PM)
+ *                      →  PM (/dev/pmem0)
+ *
+ * Without fdatasync, pwrite() to ext4-dax only fills CPU cache (not PM).
+ * fdatasync() issues CLWB+SFENCE making data durable on PM media.
  *
  * Timing (global, host-side clock_gettime):
  *   START: before cudaMemcpy (simulates end of GPU compute, start of persist)
- *   STOP : after last pwrite() returns
+ *   STOP : after fdatasync() returns (data is durable on PM)
  *
  * Each of N logical "threads" corresponds to one pwrite() call of
  * MB_DATA_PER_THREAD bytes at its designated offset.  All writes are
@@ -94,14 +99,17 @@ double basic_run_seq(uint32_t nthreads)
     cudaMemcpy(g_staging, g_devbuf, MB_PAGE_SIZE, cudaMemcpyDeviceToHost);
     mb_timer_start(&t);
 
+    int failed = 0;
     for (uint32_t i = 0; i < nthreads; i++) {
         off_t off = (off_t)i * MB_DATA_PER_THREAD;
         if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, off) < 0) {
-            perror("[Basic/Seq] pwrite"); break;
+            perror("[Basic/Seq] pwrite"); failed = 1; break;
         }
     }
+    /* One fdatasync after all writes: flushes CPU cache → PM (CLWB+SFENCE) */
+    fdatasync(fd);
 
-    double ms = mb_timer_elapsed_ms(&t);
+    double ms = failed ? -1.0 : mb_timer_elapsed_ms(&t);
     close(fd);
     unlink(MB_SEQ_FILE);
     return ms;
@@ -125,13 +133,15 @@ double basic_run_rand(uint32_t nthreads)
     cudaMemcpy(g_staging, g_devbuf, MB_PAGE_SIZE, cudaMemcpyDeviceToHost);
     mb_timer_start(&t);
 
+    int failed = 0;
     for (uint32_t i = 0; i < nthreads; i++) {
         if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, offsets[i]) < 0) {
-            perror("[Basic/Rand] pwrite"); break;
+            perror("[Basic/Rand] pwrite"); failed = 1; break;
         }
     }
+    fdatasync(fd);
 
-    double ms = mb_timer_elapsed_ms(&t);
+    double ms = failed ? -1.0 : mb_timer_elapsed_ms(&t);
     free(offsets);
     close(fd);
     unlink(MB_RAND_FILE);
@@ -157,6 +167,7 @@ double basic_run_multi(uint32_t nthreads)
         if (fd < 0) { perror("[Basic/Multi] open"); break; }
         if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, 0) < 0)
             perror("[Basic/Multi] pwrite");
+        fdatasync(fd);   /* flush this file's data to PM before close */
         close(fd);
     }
 

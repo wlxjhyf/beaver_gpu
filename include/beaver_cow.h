@@ -277,6 +277,39 @@ beaver_holder_flip(beaver_holder_t *holder)
 }
 
 /*
+ * beaver_holder_stage: write src to the inactive PM slot and update cur,
+ * but issue NO fence and NO read_ptr update.
+ *
+ * Use when batching multiple writes before a single __threadfence_system().
+ * After staging all writes, call __threadfence_system() once, then call
+ * beaver_holder_publish() on each staged holder to make data visible to readers.
+ *
+ * Caller must hold h->gpu_lock.
+ */
+static __device__ __forceinline__ void
+beaver_holder_stage(beaver_holder_t *holder, const void *src)
+{
+    void *waddr = beaver_holder_write_addr(holder);
+    gpm_memcpy_nodrain(waddr, src, BEAVER_PAGE_SIZE);
+    int next = (holder->cur < 0) ? 0 : (holder->cur + 1) % 2;
+    holder->cur = next;   /* update internal slot state; no fence yet */
+}
+
+/*
+ * beaver_holder_publish: publish the staged write to readers.
+ *
+ * Must be called AFTER __threadfence_system() to ensure the PM write
+ * is durable before readers see the new read_ptr.
+ * Caller must hold h->gpu_lock, OR ensure no concurrent writers exist.
+ */
+static __device__ __forceinline__ void
+beaver_holder_publish(beaver_holder_t *holder)
+{
+    if (holder->cur >= 0)
+        *((void * volatile *)&holder->read_ptr) = holder->pm_addrs[holder->cur];
+}
+
+/*
  * beaver_holder_commit: DEPRECATED — do not call after beaver_holder_flip.
  *
  * beaver_holder_flip already issues __threadfence_system(), which is the only

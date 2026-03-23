@@ -154,6 +154,28 @@ static __device__ __forceinline__ void gpm_persist(const void* addr, size_t len)
 }
 
 /*
+ * gpm_memcpy_nodrain_warp: warp-cooperative volatile stores to PM.
+ *
+ * ALL 32 threads in the warp must call this together with the same
+ * (dest, src, len) and their own lane index (threadIdx.x & 31).
+ * Thread `lane` writes 8B words at offsets lane, lane+32, lane+64, ... ,
+ * producing a coalesced 256B PCIe write transaction per iteration across
+ * the warp — vs. 512 independent 8B transactions in the scalar path.
+ *
+ * Requires: dest and src are 8B-aligned; len is a multiple of 8.
+ * Does NOT issue a drain.
+ */
+static __device__ __forceinline__ void
+gpm_memcpy_nodrain_warp(void *dest, const void *src, size_t len, uint32_t lane)
+{
+    const uint32_t n_words = (uint32_t)(len / sizeof(GPM_DWORD));
+    volatile GPM_DWORD       *d = (volatile GPM_DWORD *)dest;
+    const          GPM_DWORD *s = (const          GPM_DWORD *)src;
+    for (uint32_t i = lane; i < n_words; i += 32u)
+        d[i] = s[i];
+}
+
+/*
  * gpm_memcpy_nodrain: copy [src, src+len) to PM dest using volatile stores.
  * Volatile stores give PM write semantics (no reordering past the store).
  * Does NOT issue a drain; call gpm_drain() or gpm_persist() afterwards

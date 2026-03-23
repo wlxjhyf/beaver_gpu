@@ -49,6 +49,17 @@ static inline void mb_grid_block(uint32_t n, uint32_t *grid, uint32_t *blk)
     *grid = (n + *blk - 1) / *blk;
 }
 
+/*
+ * mb_grid_block_warp: for warp-per-file kernels.
+ * Each block = exactly 1 warp (32 threads) = 1 logical file.
+ * Launch: <<<n_files, 32>>>.
+ */
+static inline void mb_grid_block_warp(uint32_t n_files, uint32_t *grid, uint32_t *blk)
+{
+    *blk  = 32u;
+    *grid = n_files;
+}
+
 /* ── Error check macros ──────────────────────────────────────────── */
 
 #define MB_CUDA_CHECK(call)                                              \
@@ -65,21 +76,26 @@ static inline void mb_grid_block(uint32_t n, uint32_t *grid, uint32_t *blk)
 
 static inline void mb_print_table_header(void)
 {
-    printf("  %-10s  %12s  %12s  %12s\n",
-           "Threads", "Basic(MB/s)", "cuFile(MB/s)", "Beaver(MB/s)");
-    printf("  %-10s  %12s  %12s  %12s\n",
-           "----------", "------------", "------------", "------------");
+    printf("  %-10s  %14s  %14s  %12s  %12s\n",
+           "Threads", "pwrite+fsync", "pmem_persist", "cuFile", "Beaver");
+    printf("  %-10s  %14s  %14s  %12s  %12s\n",
+           "----------", "--------------", "--------------",
+           "------------", "------------");
 }
 
-static inline void mb_print_row(uint32_t nt, double basic, double cufile, double beaver)
+static inline void mb_print_row(uint32_t nt,
+                                 double basic, double pmem,
+                                 double cufile, double beaver)
 {
-    /* -1.0 means N/A (system unavailable or skipped) */
-    char sb[16], sc[16], sv[16];
-    if (basic   < 0.0) snprintf(sb, sizeof sb, "%12s", "N/A");
-    else               snprintf(sb, sizeof sb, "%12.1f", basic);
-    if (cufile  < 0.0) snprintf(sc, sizeof sc, "%12s", "N/A");
-    else               snprintf(sc, sizeof sc, "%12.1f", cufile);
-    if (beaver  < 0.0) snprintf(sv, sizeof sv, "%12s", "N/A");
-    else               snprintf(sv, sizeof sv, "%12.1f", beaver);
-    printf("  %-10u  %s  %s  %s\n", nt, sb, sc, sv);
+    /* -1.0 means N/A */
+    char sb[16], sp[16], sc[16], sv[16];
+#define FMT(buf, w, v) \
+    do { if ((v) < 0.0) snprintf(buf,sizeof buf,"%*s",w,"N/A"); \
+         else snprintf(buf,sizeof buf,"%*.1f",w,v); } while(0)
+    FMT(sb, 14, basic);
+    FMT(sp, 14, pmem);
+    FMT(sc, 12, cufile);
+    FMT(sv, 12, beaver);
+#undef FMT
+    printf("  %-10u  %s  %s  %s  %s\n", nt, sb, sp, sc, sv);
 }

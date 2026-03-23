@@ -152,17 +152,19 @@ static double cufile_write_file(const char *path, off_t file_size,
     mb_timer_t t;
     mb_timer_start(&t);
 
+    int failed = 0;
     for (uint32_t i = 0; i < nthreads; i++) {
         ssize_t r = cuFileWrite(handle, g_devbuf, MB_DATA_PER_THREAD,
                                 offsets ? offsets[i] : (off_t)i * MB_DATA_PER_THREAD,
                                 0 /* buf_off */);
         if (r < 0) {
             fprintf(stderr, "[cuFile] cuFileWrite failed at i=%u: %zd\n", i, r);
+            failed = 1;
             break;
         }
     }
 
-    double ms = mb_timer_elapsed_ms(&t);
+    double ms = failed ? -1.0 : mb_timer_elapsed_ms(&t);
     cuFileHandleDeregister(handle);
     close(fd);
     unlink(path);

@@ -35,6 +35,8 @@
 
 /* ── FS lifecycle (mirrors bm_fs_t from perf_benchmark.cu) ──────── */
 
+//现在的做法把inode和data从上层（cache）开始就完全分离了
+//但是beaver_cache_t是向下管理PM block的
 typedef struct {
     beaver_cache_t *cow_cache;   /* inode COW holders  */
     beaver_cache_t *data_cache;  /* data page holders  */
@@ -123,16 +125,16 @@ double beaver_run_seq(uint32_t nthreads)
     if (alloc_hashes(0xA0000000u, nthreads, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
-    /* Pre-create files (not timed) */
+    /* Pre-create files (not timed): 1 warp per file */
     uint32_t grid, blk;
-    mb_grid_block(nthreads, &grid, &blk);
-    mb_create_kernel<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
+    mb_grid_block_warp(nthreads, &grid, &blk);
+    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
     cudaDeviceSynchronize();
 
-    /* Timed write phase */
+    /* Timed write phase: warp-cooperative PM stores */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_seq_write_kernel<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_seq_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
@@ -158,13 +160,13 @@ double beaver_run_rand(uint32_t nthreads)
         { bv_fs_cleanup(&bv); return -1.0; }
 
     uint32_t grid, blk;
-    mb_grid_block(nthreads, &grid, &blk);
-    mb_create_kernel<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
+    mb_grid_block_warp(nthreads, &grid, &blk);
+    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
     cudaDeviceSynchronize();
 
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_rand_write_kernel<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_rand_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
@@ -190,12 +192,12 @@ double beaver_run_multi(uint32_t nthreads)
         { bv_fs_cleanup(&bv); return -1.0; }
 
     uint32_t grid, blk;
-    mb_grid_block(nthreads, &grid, &blk);
+    mb_grid_block_warp(nthreads, &grid, &blk);
 
-    /* Timed: create + write in one kernel */
+    /* Timed: create + write in one kernel (warp-cooperative) */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_multi_write_kernel<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_multi_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);

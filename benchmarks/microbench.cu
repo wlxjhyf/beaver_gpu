@@ -27,6 +27,10 @@ int    basic_init(void);
 void   basic_cleanup(void);
 double basic_run(mb_workload_t wl, uint32_t nthreads);
 
+int    pmem_bench_init(void);
+void   pmem_bench_cleanup(void);
+double pmem_run(mb_workload_t wl, uint32_t nthreads);
+
 int    cufile_init(void);
 void   cufile_cleanup(void);
 double cufile_run(mb_workload_t wl, uint32_t nthreads);
@@ -63,7 +67,7 @@ static int check_pmem_mount(void)
 /* ── Run one workload across all thread counts ───────────────────── */
 
 static void run_workload(mb_workload_t wl,
-                          int basic_ok, int cufile_ok)
+                          int basic_ok, int pmem_ok, int cufile_ok)
 {
     printf("\n### %s ###\n", MB_WORKLOAD_NAMES[wl]);
     printf("  %u writes/thread × %u B  —  timing: task-start to task-complete\n",
@@ -74,10 +78,11 @@ static void run_workload(mb_workload_t wl,
         uint32_t nt = MB_THREAD_COUNTS[ti];
 
         double r_basic  = basic_ok  ? basic_run (wl, nt) : -1.0;
+        double r_pmem   = pmem_ok   ? pmem_run  (wl, nt) : -1.0;
         double r_cufile = cufile_ok ? cufile_run(wl, nt) : -1.0;
         double r_beaver =             beaver_run(wl, nt);
 
-        mb_print_row(nt, r_basic, r_cufile, r_beaver);
+        mb_print_row(nt, r_basic, r_pmem, r_cufile, r_beaver);
         fflush(stdout);
     }
 }
@@ -113,12 +118,15 @@ int main(void)
     int pmem_ok = (check_pmem_mount() == 0);
 
     /* Init each baseline */
-    int basic_ok  = pmem_ok && (basic_init()        == 0);
-    int cufile_ok = pmem_ok && (cufile_init()        == 0);
-    int beaver_ok = (beaver_bench_init()             == 0);
+    int basic_ok  = pmem_ok && (basic_init()       == 0);
+    int pmem_b_ok = pmem_ok && (pmem_bench_init()  == 0);
+    int cufile_ok = pmem_ok && (cufile_init()       == 0);
+    int beaver_ok = (beaver_bench_init()            == 0);
 
     if (!basic_ok)
-        fprintf(stdout, "[microbench] Basic baseline unavailable (see above).\n");
+        fprintf(stdout, "[microbench] pwrite+fsync baseline unavailable (see above).\n");
+    if (!pmem_b_ok)
+        fprintf(stdout, "[microbench] pmem_persist baseline unavailable (see above).\n");
     if (!cufile_ok)
         fprintf(stdout, "[microbench] cuFile baseline unavailable (see above).\n");
     if (!beaver_ok) {
@@ -127,20 +135,21 @@ int main(void)
     }
 
     printf("\nWorkload parameters:\n");
-    printf("  Threads        : ");
+    printf("  Threads          : ");
     for (uint32_t i = 0; i < MB_NT_COUNT; i++)
         printf("%u%s", MB_THREAD_COUNTS[i], i+1 < MB_NT_COUNT ? ", " : "\n");
-    printf("  Data/thread    : %u writes × %u B = %u KiB\n",
+    printf("  Data/thread      : %u writes × %u B = %u KiB\n",
            MB_WRITES_PER_THREAD, MB_PAGE_SIZE, MB_DATA_PER_THREAD / 1024);
-    printf("  Metric         : aggregate write throughput (MB/s)\n");
-    printf("  Basic timing   : cudaMemcpy-sync → last pwrite() return\n");
-    printf("  cuFile timing  : first cuFileWrite → last cuFileWrite return\n");
-    printf("  Beaver timing  : kernel launch → cudaDeviceSynchronize\n");
+    printf("  Metric           : aggregate write throughput (MB/s)\n");
+    printf("  pwrite+fsync     : pwrite() to ext4-dax + fdatasync() → PM\n");
+    printf("  pmem_persist     : pmem_memcpy_persist() direct to PM (no FS)\n");
+    printf("  cuFile           : cuFileWrite() GDS path → ext4-dax → PM\n");
+    printf("  Beaver           : GPU warp-cooperative COW → PM (kernel→sync)\n");
 
     /* Run the three workloads */
-    run_workload(MB_SEQ,   basic_ok, cufile_ok);
-    run_workload(MB_RAND,  basic_ok, cufile_ok);
-    run_workload(MB_MULTI, basic_ok, cufile_ok);
+    run_workload(MB_SEQ,   basic_ok, pmem_b_ok, cufile_ok);
+    run_workload(MB_RAND,  basic_ok, pmem_b_ok, cufile_ok);
+    run_workload(MB_MULTI, basic_ok, pmem_b_ok, cufile_ok);
 
     printf("\n============================================================\n");
     printf("   Microbenchmark complete.\n");
@@ -148,6 +157,7 @@ int main(void)
 
 done:
     if (basic_ok)  basic_cleanup();
+    if (pmem_b_ok) pmem_bench_cleanup();
     if (cufile_ok) cufile_cleanup();
     beaver_bench_cleanup();
 

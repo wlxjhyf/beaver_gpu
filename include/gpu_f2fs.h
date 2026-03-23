@@ -131,6 +131,13 @@ __device__ void f2fs_inode_update(gpu_f2fs_t *fs, uint32_t nid);
 __device__ void beaver_inode_persist(gpu_f2fs_t *fs, uint32_t nid);
 
 /*
+ * beaver_inode_persist_stage: stage inode write WITHOUT fence/publish.
+ * Caller must hold inode_shadow[nid].lock.
+ * Follow up with __threadfence_system() + beaver_holder_publish().
+ */
+__device__ void beaver_inode_persist_stage(gpu_f2fs_t *fs, uint32_t nid);
+
+/*
  * beaver_data_write: COW write of one 4 KiB page via data_cache holder.
  * existing_holder_idx: current i_addr[pgoff] value (F2FS_NULL_ADDR = new page).
  * Returns new holder_idx (store into i_addr[pgoff]) or F2FS_NULL_ADDR on full.
@@ -140,6 +147,16 @@ __device__ uint32_t beaver_data_write(gpu_f2fs_t *fs, uint32_t nid,
                                       uint32_t pgoff,
                                       uint32_t existing_holder_idx,
                                       const void *src);
+
+/*
+ * beaver_data_write_stage: COW write of one 4 KiB page WITHOUT fence/publish.
+ * Returns new holder_idx or F2FS_NULL_ADDR on full.
+ * Caller must hold inode_shadow[nid].lock.
+ */
+__device__ uint32_t beaver_data_write_stage(gpu_f2fs_t *fs, uint32_t nid,
+                                             uint32_t pgoff,
+                                             uint32_t existing_holder_idx,
+                                             const void *src);
 
 /*
  * beaver_data_read: lock-free read of one 4 KiB page via data_cache holder.
@@ -159,6 +176,42 @@ __device__ int  gpu_f2fs_write (gpu_f2fs_t *fs, int fd, uint32_t pgoff,
 __device__ int  gpu_f2fs_read  (gpu_f2fs_t *fs, int fd, uint32_t pgoff,
                                  void *dst);
 __device__ void gpu_f2fs_close (gpu_f2fs_t *fs, int fd);
+
+/*
+ * gpu_f2fs_write_data: write one 4 KiB data page WITHOUT fence and WITHOUT
+ * inode persistence.  Updates DRAM inode fields (i_addr, i_blocks, i_size)
+ * but does NOT call f2fs_inode_update.  Call gpu_f2fs_fsync() after all
+ * pages are written to issue ONE fence and persist the inode.
+ */
+__device__ int  gpu_f2fs_write_data(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
+                                     const void *src);
+
+/*
+ * gpu_f2fs_fsync: flush all staged writes for fd with a single fence.
+ *
+ * COW mode:   stages inode write → __threadfence_system() → publishes
+ *             all pending data and inode holder read_ptrs.
+ * Ckpt mode:  __threadfence_system() → publishes pending data holders
+ *             → marks inode dirty for the next do_checkpoint().
+ *
+ * Must be called after a batch of gpu_f2fs_write_data() calls.
+ */
+__device__ void gpu_f2fs_fsync(gpu_f2fs_t *fs, int fd);
+
+/*
+ * gpu_f2fs_write_data_warp: warp-cooperative data page write (no fence).
+ *
+ * ALL 32 threads in the warp must call this together with the same
+ * (fs, fd, pgoff) and a src buffer accessible to all threads.
+ * Lane 0 handles holder allocation/lock and inode bookkeeping.
+ * All 32 lanes cooperate on the PM write via stride-32 volatile stores,
+ * producing coalesced 256B PCIe write transactions per loop iteration.
+ *
+ * Returns 0 on success (same value broadcast to all 32 lanes).
+ * Must call gpu_f2fs_fsync() (from lane 0) after all pages are staged.
+ */
+__device__ int gpu_f2fs_write_data_warp(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
+                                         const void *src);
 
 /* ------------------------------------------------------------------ */
 /* Host API declarations (gpu_f2fs.cu)                                */
@@ -230,6 +283,28 @@ static __device__ __forceinline__ void
 vfs_close(gpu_vfs_t *vfs, int fd)
 {
     gpu_f2fs_close((gpu_f2fs_t *)vfs->fs, fd);
+}
+
+static __device__ __forceinline__ int
+vfs_write_data(gpu_vfs_t *vfs, int fd, uint32_t pgoff, const void *src)
+{
+    return gpu_f2fs_write_data((gpu_f2fs_t *)vfs->fs, fd, pgoff, src);
+}
+
+static __device__ __forceinline__ void
+vfs_fsync(gpu_vfs_t *vfs, int fd)
+{
+    gpu_f2fs_fsync((gpu_f2fs_t *)vfs->fs, fd);
+}
+
+/*
+ * vfs_write_data_warp: warp-cooperative staged page write.
+ * ALL 32 threads must call this together. See gpu_f2fs_write_data_warp.
+ */
+static __device__ __forceinline__ int
+vfs_write_data_warp(gpu_vfs_t *vfs, int fd, uint32_t pgoff, const void *src)
+{
+    return gpu_f2fs_write_data_warp((gpu_f2fs_t *)vfs->fs, fd, pgoff, src);
 }
 
 #endif /* GPU_F2FS_H */

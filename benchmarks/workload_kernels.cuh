@@ -43,8 +43,9 @@ __global__ void mb_seq_write_kernel(gpu_vfs_t      *vfs,
     if (fd < 0) return;
 
     for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
-        vfs_write(vfs, fd, p, wbuf);
+        vfs_write_data(vfs, fd, p, wbuf);   /* stage only, no fence */
 
+    vfs_fsync(vfs, fd);                      /* one fence + inode persist */
     vfs_close(vfs, fd);
 }
 
@@ -79,8 +80,9 @@ __global__ void mb_rand_write_kernel(gpu_vfs_t      *vfs,
     if (fd < 0) return;
 
     for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
-        vfs_write(vfs, fd, order[p], wbuf);
+        vfs_write_data(vfs, fd, order[p], wbuf);   /* stage only, no fence */
 
+    vfs_fsync(vfs, fd);
     vfs_close(vfs, fd);
 }
 
@@ -100,7 +102,125 @@ __global__ void mb_multi_write_kernel(gpu_vfs_t      *vfs,
     if (fd < 0) return;
 
     for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
-        vfs_write(vfs, fd, p, wbuf);
+        vfs_write_data(vfs, fd, p, wbuf);   /* stage only, no fence */
 
+    vfs_fsync(vfs, fd);
     vfs_close(vfs, fd);
+}
+
+/* ================================================================== */
+/* Warp-cooperative kernels: 1 block (32 threads) = 1 logical file   */
+/*                                                                     */
+/* All 32 threads call vfs_write_data_warp together for each page.   */
+/* Adjacent threads write adjacent 8B words → coalesced PCIe writes. */
+/* Only lane 0 handles metadata (open/close/fsync/create).            */
+/*                                                                     */
+/* Launch: <<<n_files, 32>>>  (one warp per file)                     */
+/* ================================================================== */
+
+/* ── Warp file creation (setup, not timed) ──────────────────────── */
+
+__global__ void mb_create_kernel_warp(gpu_vfs_t      *vfs,
+                                       const uint32_t *hashes,
+                                       uint32_t        n)
+{
+    uint32_t file_id = blockIdx.x;
+    if (file_id >= n) return;
+    if (threadIdx.x == 0)
+        vfs_create(vfs, hashes[file_id]);
+}
+
+/* ── MB_SEQ warp: sequential page writes, coalesced PM stores ───── */
+
+__global__ void mb_seq_write_kernel_warp(gpu_vfs_t      *vfs,
+                                          const uint32_t *hashes,
+                                          const uint8_t  *wbuf,
+                                          uint32_t        n)
+{
+    uint32_t file_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;   /* 0..31 */
+    if (file_id >= n) return;
+
+    /* Lane 0 opens the file; broadcast fd to all lanes */
+    int fd = -1;
+    if (lane == 0) fd = vfs_open(vfs, hashes[file_id]);
+    fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+    if (fd < 0) return;
+
+    /* All lanes cooperate on each page write */
+    for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+        vfs_write_data_warp(vfs, fd, p, wbuf);
+
+    /* Lane 0 issues the single fence + inode persist */
+    if (lane == 0) {
+        vfs_fsync(vfs, fd);
+        vfs_close(vfs, fd);
+    }
+}
+
+/* ── MB_RAND warp: random-order page writes, coalesced PM stores ── */
+
+__global__ void mb_rand_write_kernel_warp(gpu_vfs_t      *vfs,
+                                           const uint32_t *hashes,
+                                           const uint8_t  *wbuf,
+                                           uint32_t        n)
+{
+    uint32_t file_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;
+
+    /* Build shuffle order in shared memory (visible to all lanes) */
+    __shared__ uint32_t order[MB_WRITES_PER_THREAD];
+
+    if (file_id < n && lane == 0) {
+        for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++) order[p] = p;
+        uint32_t rng = file_id * 2654435761u + 1u;
+        for (uint32_t p = MB_WRITES_PER_THREAD - 1; p > 0; p--) {
+            rng = rng * 1664525u + 1013904223u;
+            uint32_t j   = rng % (p + 1);
+            uint32_t tmp = order[p]; order[p] = order[j]; order[j] = tmp;
+        }
+    }
+    __syncwarp(0xFFFFFFFFu);   /* ensure order[] visible before all lanes read */
+
+    if (file_id >= n) return;
+
+    int fd = -1;
+    if (lane == 0) fd = vfs_open(vfs, hashes[file_id]);
+    fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+    if (fd < 0) return;
+
+    for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+        vfs_write_data_warp(vfs, fd, order[p], wbuf);
+
+    if (lane == 0) {
+        vfs_fsync(vfs, fd);
+        vfs_close(vfs, fd);
+    }
+}
+
+/* ── MB_MULTI warp: create + sequential write, all timed ────────── */
+
+__global__ void mb_multi_write_kernel_warp(gpu_vfs_t      *vfs,
+                                            const uint32_t *hashes,
+                                            const uint8_t  *wbuf,
+                                            uint32_t        n)
+{
+    uint32_t file_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;
+    if (file_id >= n) return;
+
+    if (lane == 0) vfs_create(vfs, hashes[file_id]);
+
+    int fd = -1;
+    if (lane == 0) fd = vfs_open(vfs, hashes[file_id]);
+    fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+    if (fd < 0) return;
+
+    for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+        vfs_write_data_warp(vfs, fd, p, wbuf);
+
+    if (lane == 0) {
+        vfs_fsync(vfs, fd);
+        vfs_close(vfs, fd);
+    }
 }

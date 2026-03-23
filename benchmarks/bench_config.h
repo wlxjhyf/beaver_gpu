@@ -21,7 +21,7 @@ static const uint32_t MB_THREAD_COUNTS[MB_NT_COUNT] = {
 };
 
 /* ── Storage paths ───────────────────────────────────────────────── */
-#define MB_PMEM_MOUNT   "/mnt/pmem0"          /* ext4-dax on /dev/pmem0  */
+#define MB_PMEM_MOUNT   "/mnt/pmem"           /* ext4-dax on /dev/pmem0  */
 #define MB_FILE_FMT     MB_PMEM_MOUNT "/mb_%06u.dat"  /* per-thread files */
 #define MB_SEQ_FILE     MB_PMEM_MOUNT "/mb_seq.dat"   /* shared single file */
 #define MB_RAND_FILE    MB_PMEM_MOUNT "/mb_rand.dat"

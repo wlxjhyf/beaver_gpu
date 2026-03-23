@@ -42,6 +42,7 @@ __device__ void f2fs_inode_update(gpu_f2fs_t *fs, uint32_t nid)
  * gpu_f2fs_create: allocate a new inode, zero-init, insert into name_table.
  * Returns nid (fd) on success, -1 on full pool or full name_table.
  */
+// 合理，只是多线程加速create
 __device__ int gpu_f2fs_create(gpu_f2fs_t *fs, uint32_t name_hash)
 {
     uint32_t nid = atomicAdd(&fs->inode_cursor, 1u);
@@ -104,6 +105,7 @@ __device__ int gpu_f2fs_open(gpu_f2fs_t *fs, uint32_t name_hash)
  *
  * Returns 0 on success, -1 bad fd/pgoff, -2 data_cache full.
  */
+ //代码合理，应该是核函数本身不合理导致的
 __device__ int gpu_f2fs_write(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
                                const void *src)
 {
@@ -136,6 +138,186 @@ __device__ int gpu_f2fs_write(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
 
     beaver_spin_unlock(&s->lock);
     return 0;
+}
+
+/*
+ * gpu_f2fs_write_data: write one data page to PM (no fence, no inode persist).
+ *
+ * Stages the data write via beaver_data_write_stage and updates DRAM inode
+ * fields (i_addr, i_blocks, i_size).  No __threadfence_system() is issued.
+ * Call gpu_f2fs_fsync() after all pages in the batch are written.
+ */
+__device__ int gpu_f2fs_write_data(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
+                                    const void *src)
+{
+    if (fd < 0 || (uint32_t)fd >= fs->max_inodes) return -1;
+    if (pgoff >= F2FS_ADDRS_PER_INODE)            return -1;
+
+    f2fs_inode_shadow_t *s = &fs->inode_shadow[(uint32_t)fd];
+    beaver_spin_lock(&s->lock);
+
+    uint32_t existing = s->inode.i_addr[pgoff];
+    uint32_t new_idx  = beaver_data_write_stage(fs, (uint32_t)fd, pgoff,
+                                                 existing, src);
+    if (new_idx == (uint32_t)F2FS_NULL_ADDR) {
+        beaver_spin_unlock(&s->lock);
+        return -2;
+    }
+
+    if (existing == (uint32_t)F2FS_NULL_ADDR) {
+        s->inode.i_addr[pgoff] = new_idx;
+        s->inode.i_blocks++;
+    }
+    uint64_t new_end = ((uint64_t)pgoff + 1) * BEAVER_PAGE_SIZE;
+    if (new_end > s->inode.i_size)
+        s->inode.i_size = new_end;
+
+    beaver_spin_unlock(&s->lock);
+    return 0;
+}
+
+/*
+ * gpu_f2fs_write_data_warp: warp-cooperative data page write (no fence).
+ *
+ * ALL 32 threads in the warp must call this function together with the
+ * same (fs, fd, pgoff) and a src buffer accessible by all 32 threads.
+ *
+ * Lane 0 handles holder allocation/lock and inode bookkeeping.
+ * All 32 lanes cooperate on the PM write via stride-32 volatile stores,
+ * producing coalesced 256B PCIe write transactions per loop iteration
+ * (vs. 512 independent 8B transactions in the scalar gpu_f2fs_write_data).
+ *
+ * The PM write address is broadcast from lane 0 to all lanes via warp shuffle.
+ * s->lock and h->gpu_lock are held across the cooperative PM write phase and
+ * released by lane 0 in Phase 3.
+ *
+ * Returns 0 on success (all lanes receive the same value).
+ * Must call gpu_f2fs_fsync() (from lane 0) after all pages are written.
+ */
+__device__ int gpu_f2fs_write_data_warp(gpu_f2fs_t *fs, int fd, uint32_t pgoff,
+                                         const void *src)
+{
+    uint32_t lane = threadIdx.x & 31u;
+
+    /* ── Phase 1 : lane 0 allocates/finds the holder, acquires write addr ─ */
+    int       phase1_ok = 0;
+    uintptr_t waddr_int = 0;                  /* PM write address as integer  */
+    f2fs_inode_shadow_t *p1_s = NULL;         /* inode shadow (lane 0 only)   */
+    beaver_holder_t     *p1_h = NULL;         /* data holder  (lane 0 only)   */
+
+    if (lane == 0) {
+        if (fd < 0 || (uint32_t)fd >= fs->max_inodes ||
+            pgoff >= F2FS_ADDRS_PER_INODE) {
+            phase1_ok = -1;
+        } else {
+            p1_s = &fs->inode_shadow[(uint32_t)fd];
+            beaver_spin_lock(&p1_s->lock);
+
+            uint32_t existing = p1_s->inode.i_addr[pgoff];
+
+            if (existing != (uint32_t)F2FS_NULL_ADDR) {
+                /* Reuse existing holder: COW flips to the inactive slot */
+                p1_h = &fs->data_cache->holders[existing];
+            } else {
+                /* First write to this page: claim a new holder */
+                uint32_t new_idx = atomicAdd(&fs->data_cache->alloc_cursor, 1u);
+                if (new_idx >= fs->data_cache->max_holders) {
+                    atomicSub(&fs->data_cache->alloc_cursor, 1u);
+                    beaver_spin_unlock(&p1_s->lock);
+                    phase1_ok = -2;         /* data_cache full */
+                } else {
+                    p1_h = &fs->data_cache->holders[new_idx];
+                    p1_h->gpu_lock = 0;
+                    p1_h->cur      = -1;
+                    p1_h->state    = HOLDER_INIT;
+                    p1_h->_pad     = 0;
+                    p1_h->read_ptr = NULL;
+                    p1_h->page_id  = beaver_data_page_id((uint32_t)fd, pgoff);
+                    beaver_hash_insert(fs->data_cache->hash_table,
+                                       fs->data_cache->hash_size,
+                                       p1_h->page_id, new_idx);
+                    p1_s->inode.i_addr[pgoff] = new_idx;
+                    p1_s->inode.i_blocks++;
+                }
+            }
+
+            if (phase1_ok == 0) {
+                beaver_spin_lock(&p1_h->gpu_lock);
+                waddr_int = (uintptr_t)beaver_holder_write_addr(p1_h);
+                uint64_t new_end = ((uint64_t)pgoff + 1) * BEAVER_PAGE_SIZE;
+                if (new_end > p1_s->inode.i_size)
+                    p1_s->inode.i_size = new_end;
+                /* p1_s->lock and p1_h->gpu_lock remain held through Phase 3 */
+            }
+        }
+    }
+
+    /* ── Phase 2 : broadcast PM dest, all 32 lanes write cooperatively ───── */
+    uint32_t w_lo = __shfl_sync(0xFFFFFFFFu, (uint32_t)(waddr_int & 0xFFFFFFFFu), 0);
+    uint32_t w_hi = __shfl_sync(0xFFFFFFFFu, (uint32_t)(waddr_int >> 32),          0);
+    void *pm_dst  = (void *)((uintptr_t)w_hi << 32 | w_lo);
+
+    if (pm_dst != NULL) {
+        /* stride-32 stores: adjacent lanes → adjacent PM addresses → coalesced */
+        const uint32_t n_words = BEAVER_PAGE_SIZE / sizeof(unsigned long long);
+        volatile unsigned long long       *d    = (volatile unsigned long long *)pm_dst;
+        const          unsigned long long *sbuf = (const unsigned long long *)src;
+        for (uint32_t i = lane; i < n_words; i += 32u)
+            d[i] = sbuf[i];
+    }
+
+    /* ── Phase 3 : lane 0 updates holder state, writes log, releases locks ── */
+    if (lane == 0 && phase1_ok == 0) {
+        int next   = (p1_h->cur < 0) ? 0 : (p1_h->cur + 1) % 2;
+        p1_h->cur  = next;
+        beaver_log_write(&fs->log, BLOG_DATA_FLIP,
+                         (uint32_t)fd, pgoff, (uint32_t)next);
+        beaver_spin_unlock(&p1_h->gpu_lock);
+        beaver_spin_unlock(&p1_s->lock);
+    }
+
+    /* Broadcast return code so all lanes get the same value */
+    phase1_ok = __shfl_sync(0xFFFFFFFFu, phase1_ok, 0);
+    return phase1_ok;
+}
+
+/*
+ * gpu_f2fs_fsync: flush all staged writes with a single __threadfence_system().
+ *
+ * COW mode:   stage inode → fence → publish all data + inode holders.
+ * Ckpt mode:  fence → publish all data holders → mark inode dirty.
+ */
+__device__ void gpu_f2fs_fsync(gpu_f2fs_t *fs, int fd)
+{
+    if (fd < 0 || (uint32_t)fd >= fs->max_inodes) return;
+
+    f2fs_inode_shadow_t *s = &fs->inode_shadow[(uint32_t)fd];
+    beaver_spin_lock(&s->lock);
+
+    if (fs->use_cow)
+        beaver_inode_persist_stage(fs, (uint32_t)fd);
+
+    __threadfence_system();   /* single drain: all staged PM writes durable */
+
+    /* Publish data holders up to last written page */
+    uint32_t max_pgoff = (uint32_t)
+        ((s->inode.i_size + BEAVER_PAGE_SIZE - 1) / BEAVER_PAGE_SIZE);
+    if (max_pgoff > F2FS_ADDRS_PER_INODE)
+        max_pgoff = F2FS_ADDRS_PER_INODE;
+    for (uint32_t p = 0; p < max_pgoff; p++) {
+        uint32_t idx = s->inode.i_addr[p];
+        if (idx != (uint32_t)F2FS_NULL_ADDR)
+            beaver_holder_publish(&fs->data_cache->holders[idx]);
+    }
+
+    if (fs->use_cow) {
+        beaver_holder_t *ih = beaver_find_holder(fs->cow_cache, (uint64_t)fd);
+        if (ih) beaver_holder_publish(ih);
+    } else {
+        fs->dirty_flags[(uint32_t)fd] = 1;
+    }
+
+    beaver_spin_unlock(&s->lock);
 }
 
 /*

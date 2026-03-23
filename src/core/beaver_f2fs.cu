@@ -115,6 +115,81 @@ __device__ uint32_t beaver_data_write(
 }
 
 /* ================================================================== */
+/* Device: staged writes (no fence, no read_ptr publish)              */
+/* ================================================================== */
+
+/*
+ * beaver_data_write_stage: COW write of one data page WITHOUT fence.
+ *
+ * Same allocation / holder-lookup logic as beaver_data_write, but uses
+ * beaver_holder_stage() instead of beaver_holder_flip(), so no
+ * __threadfence_system() is issued.  The caller is responsible for
+ * issuing ONE __threadfence_system() after all staged writes, then
+ * calling beaver_holder_publish() on every staged holder.
+ *
+ * Returns holder_idx (store into i_addr[pgoff]), or F2FS_NULL_ADDR on full.
+ * Caller must hold inode_shadow[nid].lock.
+ */
+__device__ uint32_t beaver_data_write_stage(
+        gpu_f2fs_t *fs, uint32_t nid, uint32_t pgoff,
+        uint32_t existing_holder_idx, const void *src)
+{
+    beaver_holder_t *h;
+    uint32_t idx;
+
+    if (existing_holder_idx != (uint32_t)F2FS_NULL_ADDR) {
+        idx = existing_holder_idx;
+        h   = &fs->data_cache->holders[idx];
+    } else {
+        idx = atomicAdd(&fs->data_cache->alloc_cursor, 1u);
+        if (idx >= fs->data_cache->max_holders) {
+            atomicSub(&fs->data_cache->alloc_cursor, 1u);
+            return (uint32_t)F2FS_NULL_ADDR;
+        }
+        h = &fs->data_cache->holders[idx];
+        h->gpu_lock = 0;
+        h->cur      = -1;
+        h->state    = HOLDER_INIT;
+        h->_pad     = 0;
+        h->read_ptr = NULL;
+        h->page_id  = beaver_data_page_id(nid, pgoff);
+        beaver_hash_insert(fs->data_cache->hash_table,
+                           fs->data_cache->hash_size,
+                           h->page_id, idx);
+    }
+
+    beaver_spin_lock(&h->gpu_lock);
+    beaver_holder_stage(h, src);          /* write + cur update, no fence */
+    int next = h->cur;
+    beaver_log_write(&fs->log, BLOG_DATA_FLIP, nid, pgoff, (uint32_t)next);
+    beaver_spin_unlock(&h->gpu_lock);
+    return idx;
+}
+
+/*
+ * beaver_inode_persist_stage: stage inode write to PM WITHOUT fence.
+ *
+ * Like beaver_inode_persist but uses beaver_holder_stage() so no
+ * __threadfence_system() is issued.  Caller issues the fence separately
+ * (in gpu_f2fs_fsync) then calls beaver_holder_publish() on the inode holder.
+ *
+ * Caller must hold inode_shadow[nid].lock.
+ */
+__device__ void beaver_inode_persist_stage(gpu_f2fs_t *fs, uint32_t nid)
+{
+    beaver_holder_t *h = beaver_find_holder(fs->cow_cache, (uint64_t)nid);
+    if (!h) return;
+
+    beaver_spin_lock(&h->gpu_lock);
+    void *waddr = beaver_holder_write_addr(h);
+    gpm_memcpy_nodrain(waddr, &fs->inode_shadow[nid].inode, BEAVER_PAGE_SIZE);
+    int next = (h->cur < 0) ? 0 : (h->cur + 1) % 2;
+    h->cur = next;
+    beaver_log_write(&fs->log, BLOG_INODE_FLIP, nid, (uint32_t)-1, (uint32_t)next);
+    beaver_spin_unlock(&h->gpu_lock);
+}
+
+/* ================================================================== */
 /* Device: data page lock-free read                                    */
 /* ================================================================== */
 

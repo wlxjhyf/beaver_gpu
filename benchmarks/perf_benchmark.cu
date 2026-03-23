@@ -215,8 +215,9 @@ __global__ void bm_write_kernel(gpu_vfs_t      *vfs,
     int fd = vfs_open(vfs, name_hashes[tid]);
     if (fd < 0) { atomicAdd(errors, 1u); return; }
     for (uint32_t i = 0; i < writes_per_thread; ++i)
-        if (vfs_write(vfs, fd, i, wbuf) != 0)
+        if (vfs_write_data(vfs, fd, i, wbuf) != 0)   /* stage, no fence */
             atomicAdd(errors, 1u);
+    vfs_fsync(vfs, fd);   /* one fence + inode persist for entire batch */
     vfs_close(vfs, fd);
 }
 
@@ -239,8 +240,9 @@ __global__ void bm3_batch_write_kernel(gpu_vfs_t      *vfs,
     int fd = vfs_open(vfs, name_hashes[tid]);
     if (fd < 0) { atomicAdd(errors, 1u); return; }
     for (uint32_t i = 0; i < batch_size; ++i)
-        if (vfs_write(vfs, fd, pgoff_start + i, wbuf) != 0)
+        if (vfs_write_data(vfs, fd, pgoff_start + i, wbuf) != 0)
             atomicAdd(errors, 1u);
+    vfs_fsync(vfs, fd);   /* one fence per batch before checkpoint */
     vfs_close(vfs, fd);
 }
 
