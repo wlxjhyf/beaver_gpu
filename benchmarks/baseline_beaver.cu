@@ -110,99 +110,102 @@ void beaver_bench_cleanup(void)
 
 /* ── MB_SEQ ──────────────────────────────────────────────────────── */
 
+/* Uses MB_BEAVER_WARPS GPU warps; each warp handles
+ * ceil(MB_TOTAL_FILES / MB_BEAVER_WARPS) files serially.
+ * nthreads parameter is ignored. */
 double beaver_run_seq(uint32_t nthreads)
 {
-    uint32_t max_inodes = nthreads;
-    uint32_t max_data   = nthreads * MB_WRITES_PER_THREAD;
+    (void)nthreads;
+    uint32_t n       = MB_TOTAL_FILES;
+    uint32_t n_warps = MB_BEAVER_WARPS;
 
     bv_fs_t bv;
-    if (bv_fs_init(&bv, max_inodes, max_data) != 0) {
-        fprintf(stderr, "[Beaver/Seq] FS init failed at nthreads=%u\n", nthreads);
+    if (bv_fs_init(&bv, n, n * MB_WRITES_PER_THREAD) != 0) {
+        fprintf(stderr, "[Beaver/Seq] FS init failed (MB_TOTAL_FILES=%u)\n", n);
         return -1.0;
     }
 
     uint32_t *d_hashes = NULL;
-    if (alloc_hashes(0xA0000000u, nthreads, &d_hashes) != 0)
+    if (alloc_hashes(0xA0000000u, n, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
-    /* Pre-create files (not timed): 1 warp per file */
+    /* Setup: create all files in parallel (not timed) */
     uint32_t grid, blk;
-    mb_grid_block_warp(nthreads, &grid, &blk);
-    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
+    mb_grid_block_warp(n, &grid, &blk);
+    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, n);
     cudaDeviceSynchronize();
 
-    /* Timed write phase: warp-cooperative PM stores */
+    /* Timed write: n_warps warps, each loops over a slice of files */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_seq_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_seq_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
     bv_fs_cleanup(&bv);
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 }
 
 /* ── MB_RAND ─────────────────────────────────────────────────────── */
 
 double beaver_run_rand(uint32_t nthreads)
 {
-    uint32_t max_inodes = nthreads;
-    uint32_t max_data   = nthreads * MB_WRITES_PER_THREAD;
+    (void)nthreads;
+    uint32_t n       = MB_TOTAL_FILES;
+    uint32_t n_warps = MB_BEAVER_WARPS;
 
     bv_fs_t bv;
-    if (bv_fs_init(&bv, max_inodes, max_data) != 0) {
-        fprintf(stderr, "[Beaver/Rand] FS init failed at nthreads=%u\n", nthreads);
+    if (bv_fs_init(&bv, n, n * MB_WRITES_PER_THREAD) != 0) {
+        fprintf(stderr, "[Beaver/Rand] FS init failed (MB_TOTAL_FILES=%u)\n", n);
         return -1.0;
     }
 
     uint32_t *d_hashes = NULL;
-    if (alloc_hashes(0xA1000000u, nthreads, &d_hashes) != 0)
+    if (alloc_hashes(0xA1000000u, n, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
     uint32_t grid, blk;
-    mb_grid_block_warp(nthreads, &grid, &blk);
-    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, nthreads);
+    mb_grid_block_warp(n, &grid, &blk);
+    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, n);
     cudaDeviceSynchronize();
 
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_rand_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_rand_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
     bv_fs_cleanup(&bv);
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 }
 
 /* ── MB_MULTI ────────────────────────────────────────────────────── */
 
 double beaver_run_multi(uint32_t nthreads)
 {
-    uint32_t max_inodes = nthreads;
-    uint32_t max_data   = nthreads * MB_WRITES_PER_THREAD;
+    (void)nthreads;
+    uint32_t n       = MB_TOTAL_FILES;
+    uint32_t n_warps = MB_BEAVER_WARPS;
 
     bv_fs_t bv;
-    if (bv_fs_init(&bv, max_inodes, max_data) != 0) {
-        fprintf(stderr, "[Beaver/Multi] FS init failed at nthreads=%u\n", nthreads);
+    if (bv_fs_init(&bv, n, n * MB_WRITES_PER_THREAD) != 0) {
+        fprintf(stderr, "[Beaver/Multi] FS init failed (MB_TOTAL_FILES=%u)\n", n);
         return -1.0;
     }
 
     uint32_t *d_hashes = NULL;
-    if (alloc_hashes(0xA2000000u, nthreads, &d_hashes) != 0)
+    if (alloc_hashes(0xA2000000u, n, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
-    uint32_t grid, blk;
-    mb_grid_block_warp(nthreads, &grid, &blk);
-
-    /* Timed: create + write in one kernel (warp-cooperative) */
+    /* MB_MULTI: create + write all timed together */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_multi_write_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, g_wbuf, nthreads);
+    mb_multi_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
     bv_fs_cleanup(&bv);
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 }
 
 /* ── Dispatch ────────────────────────────────────────────────────── */

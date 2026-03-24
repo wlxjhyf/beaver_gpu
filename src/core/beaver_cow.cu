@@ -10,6 +10,7 @@
 #include "beaver_cow.h"
 #include "gpm_interface.cuh"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <cuda_runtime.h>
 
@@ -123,10 +124,11 @@ beaver_error_t beaver_cache_init(beaver_cache_t *cache, uint32_t max_holders)
     cache->alloc_cursor   = 0;
     cache->is_initialized = 1;
 
-    printf("beaver_cache_init: %u holders, PM slab %zu MiB at %p "
-           "(is_pmem=%d)  holders/hash_table in GPU device memory\n",
-           max_holders, slab_size >> 20,
-           cache->pm_base, cache->pm_region.is_pmem);
+    if (getenv("VERBOSE"))
+        printf("beaver_cache_init: %u holders, PM slab %zu MiB at %p "
+               "(is_pmem=%d)  holders/hash_table in GPU device memory\n",
+               max_holders, slab_size >> 20,
+               cache->pm_base, cache->pm_region.is_pmem);
 
     return BEAVER_SUCCESS;
 }
@@ -181,8 +183,9 @@ int beaver_log_init(beaver_log_t *log, uint32_t capacity)
     /* Zero all entries on PM so recovery sees no stale magic values */
     pmem_memset_persist(log->entries, 0, entries_sz);
 
-    printf("beaver_log_init: %u entries (%.1f KiB PM) at %p\n",
-           capacity, (double)entries_sz / 1024.0, (void *)log->entries);
+    if (getenv("VERBOSE"))
+        printf("beaver_log_init: %u entries (%.1f KiB PM) at %p\n",
+               capacity, (double)entries_sz / 1024.0, (void *)log->entries);
     return 0;
 }
 

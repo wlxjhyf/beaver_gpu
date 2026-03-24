@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -89,8 +90,15 @@ static void run_workload(mb_workload_t wl,
 
 /* ── main ────────────────────────────────────────────────────────── */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Parse -v / VERBOSE=1 before any library init so getenv("VERBOSE") works */
+    int verbose = (getenv("VERBOSE") != NULL);
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0)
+            verbose = 1;
+    if (verbose) setenv("VERBOSE", "1", 1);
+
     printf("============================================================\n");
     printf("   beaver_gpu  Microbenchmark  (GoFS §4.1/4.2 aligned)\n");
     printf("============================================================\n");
@@ -135,16 +143,22 @@ int main(void)
     }
 
     printf("\nWorkload parameters:\n");
-    printf("  Threads          : ");
+    printf("  Fixed data/run   : %u files × %u KiB = %u MiB\n",
+           MB_TOTAL_FILES, MB_DATA_PER_THREAD / 1024,
+           (uint32_t)((size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD / (1024*1024)));
+    printf("  CPU Workers      : ");
     for (uint32_t i = 0; i < MB_NT_COUNT; i++)
         printf("%u%s", MB_THREAD_COUNTS[i], i+1 < MB_NT_COUNT ? ", " : "\n");
-    printf("  Data/thread      : %u writes × %u B = %u KiB\n",
-           MB_WRITES_PER_THREAD, MB_PAGE_SIZE, MB_DATA_PER_THREAD / 1024);
-    printf("  Metric           : aggregate write throughput (MB/s)\n");
-    printf("  pwrite+fsync     : pwrite() to ext4-dax + fdatasync() → PM\n");
-    printf("  pmem_persist     : pmem_memcpy_persist() direct to PM (no FS)\n");
-    printf("  cuFile           : cuFileWrite() GDS path → ext4-dax → PM\n");
-    printf("  Beaver           : GPU warp-cooperative COW → PM (kernel→sync)\n");
+    printf("  Beaver           : %u GPU warp(s), each handles ~%u files serially\n",
+           MB_BEAVER_WARPS,
+           (MB_TOTAL_FILES + MB_BEAVER_WARPS - 1) / MB_BEAVER_WARPS);
+    printf("  Metric           : aggregate throughput (MB/s), same data for all rows\n");
+    printf("  pwrite+fsync     : GPU VRAM→(pageable cudaMemcpy)→DRAM→pwrite+fdatasync→PM\n");
+    printf("  pmem_persist     : GPU VRAM→(pageable cudaMemcpy)→DRAM→MOVNTI+SFENCE→PM\n");
+    printf("  cuFile           : GPU VRAM→cuFileWrite(GDS, serial)→ext4-dax→PM\n");
+    printf("  Beaver(GPU)      : GPU kernel→GPM direct stores→PM (no CPU involvement)\n");
+    if (!verbose)
+        printf("  (run with -v or VERBOSE=1 to see diagnostic output)\n");
 
     /* Run the three workloads */
     run_workload(MB_SEQ,   basic_ok, pmem_b_ok, cufile_ok);

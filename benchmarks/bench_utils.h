@@ -34,10 +34,11 @@ static inline double mb_cuda_sync_elapsed_ms(const mb_timer_t *t)
 
 /* ── Throughput calculation ──────────────────────────────────────── */
 
-static inline double mb_throughput(uint32_t nthreads, double elapsed_ms)
+/* Fixed-total throughput: always MB_TOTAL_FILES × MB_DATA_PER_THREAD bytes. */
+static inline double mb_throughput(double elapsed_ms)
 {
     if (elapsed_ms <= 0.0) return -1.0;
-    double bytes = (double)nthreads * MB_DATA_PER_THREAD;
+    double bytes = (double)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
     return bytes / (elapsed_ms / 1000.0) / (1024.0 * 1024.0);  /* MB/s */
 }
 
@@ -76,18 +77,17 @@ static inline void mb_grid_block_warp(uint32_t n_files, uint32_t *grid, uint32_t
 
 static inline void mb_print_table_header(void)
 {
-    printf("  %-10s  %14s  %14s  %12s  %12s\n",
-           "Threads", "pwrite+fsync", "pmem_persist", "cuFile", "Beaver");
-    printf("  %-10s  %14s  %14s  %12s  %12s\n",
-           "----------", "--------------", "--------------",
+    printf("  %-12s  %14s  %14s  %12s  %12s\n",
+           "CPU Workers", "pwrite+fsync", "pmem_persist", "cuFile", "Beaver(GPU)");
+    printf("  %-12s  %14s  %14s  %12s  %12s\n",
+           "------------", "--------------", "--------------",
            "------------", "------------");
 }
 
-static inline void mb_print_row(uint32_t nt,
+static inline void mb_print_row(uint32_t nw,
                                  double basic, double pmem,
                                  double cufile, double beaver)
 {
-    /* -1.0 means N/A */
     char sb[16], sp[16], sc[16], sv[16];
 #define FMT(buf, w, v) \
     do { if ((v) < 0.0) snprintf(buf,sizeof buf,"%*s",w,"N/A"); \
@@ -97,5 +97,5 @@ static inline void mb_print_row(uint32_t nt,
     FMT(sc, 12, cufile);
     FMT(sv, 12, beaver);
 #undef FMT
-    printf("  %-10u  %s  %s  %s  %s\n", nt, sb, sp, sc, sv);
+    printf("  %-12u  %s  %s  %s  %s\n", nw, sb, sp, sc, sv);
 }

@@ -224,3 +224,114 @@ __global__ void mb_multi_write_kernel_warp(gpu_vfs_t      *vfs,
         vfs_close(vfs, fd);
     }
 }
+
+/* ================================================================== */
+/* Loop kernels: each warp handles ceil(n / gridDim.x) files serially */
+/*                                                                     */
+/* Launch: <<<MB_BEAVER_WARPS, 32>>>                                  */
+/*                                                                     */
+/* Fewer concurrent warps → fewer simultaneous PM writers →           */
+/* less WPQ fragmentation → higher PM write-combining efficiency.     */
+/* rawgpm (b): 1 warp ≈ 3165 MB/s  vs  128 warps ≈ 2000 MB/s.       */
+/* ================================================================== */
+
+/* ── MB_SEQ loop: sequential page writes, one warp per slice ─────── */
+
+__global__ void mb_seq_write_kernel_loop(gpu_vfs_t      *vfs,
+                                          const uint32_t *hashes,
+                                          const uint8_t  *wbuf,
+                                          uint32_t        n)
+{
+    uint32_t warp_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;
+    uint32_t n_warps = gridDim.x;
+
+    uint32_t per      = (n + n_warps - 1) / n_warps;
+    uint32_t fi_start = warp_id * per;
+    uint32_t fi_end   = (fi_start + per < n) ? fi_start + per : n;
+
+    for (uint32_t fi = fi_start; fi < fi_end; fi++) {
+        int fd = -1;
+        if (lane == 0) fd = vfs_open(vfs, hashes[fi]);
+        fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+        if (fd >= 0) {
+            for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+                vfs_write_data_warp(vfs, fd, p, wbuf);
+            if (lane == 0) { vfs_fsync(vfs, fd); vfs_close(vfs, fd); }
+        }
+        __syncwarp(0xFFFFFFFFu);
+    }
+}
+
+/* ── MB_RAND loop: random-order page writes, one warp per slice ──── */
+
+__global__ void mb_rand_write_kernel_loop(gpu_vfs_t      *vfs,
+                                           const uint32_t *hashes,
+                                           const uint8_t  *wbuf,
+                                           uint32_t        n)
+{
+    uint32_t warp_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;
+    uint32_t n_warps = gridDim.x;
+
+    __shared__ uint32_t order[MB_WRITES_PER_THREAD];
+
+    uint32_t per      = (n + n_warps - 1) / n_warps;
+    uint32_t fi_start = warp_id * per;
+    uint32_t fi_end   = (fi_start + per < n) ? fi_start + per : n;
+
+    for (uint32_t fi = fi_start; fi < fi_end; fi++) {
+        /* Lane 0 builds shuffle order for this file */
+        if (lane == 0) {
+            for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++) order[p] = p;
+            uint32_t rng = fi * 2654435761u + 1u;
+            for (uint32_t p = MB_WRITES_PER_THREAD - 1; p > 0; p--) {
+                rng = rng * 1664525u + 1013904223u;
+                uint32_t j   = rng % (p + 1);
+                uint32_t tmp = order[p]; order[p] = order[j]; order[j] = tmp;
+            }
+        }
+        __syncwarp(0xFFFFFFFFu);
+
+        int fd = -1;
+        if (lane == 0) fd = vfs_open(vfs, hashes[fi]);
+        fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+        if (fd >= 0) {
+            for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+                vfs_write_data_warp(vfs, fd, order[p], wbuf);
+            if (lane == 0) { vfs_fsync(vfs, fd); vfs_close(vfs, fd); }
+        }
+        __syncwarp(0xFFFFFFFFu);
+    }
+}
+
+/* ── MB_MULTI loop: create + sequential write, one warp per slice ── */
+
+__global__ void mb_multi_write_kernel_loop(gpu_vfs_t      *vfs,
+                                            const uint32_t *hashes,
+                                            const uint8_t  *wbuf,
+                                            uint32_t        n)
+{
+    uint32_t warp_id = blockIdx.x;
+    uint32_t lane    = threadIdx.x;
+    uint32_t n_warps = gridDim.x;
+
+    uint32_t per      = (n + n_warps - 1) / n_warps;
+    uint32_t fi_start = warp_id * per;
+    uint32_t fi_end   = (fi_start + per < n) ? fi_start + per : n;
+
+    for (uint32_t fi = fi_start; fi < fi_end; fi++) {
+        if (lane == 0) vfs_create(vfs, hashes[fi]);
+        __syncwarp(0xFFFFFFFFu);
+
+        int fd = -1;
+        if (lane == 0) fd = vfs_open(vfs, hashes[fi]);
+        fd = __shfl_sync(0xFFFFFFFFu, fd, 0);
+        if (fd >= 0) {
+            for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+                vfs_write_data_warp(vfs, fd, p, wbuf);
+            if (lane == 0) { vfs_fsync(vfs, fd); vfs_close(vfs, fd); }
+        }
+        __syncwarp(0xFFFFFFFFu);
+    }
+}

@@ -28,6 +28,9 @@
 #include <string.h>
 #include <errno.h>
 
+/* Print only when VERBOSE=1 is set in environment */
+static int gpm_verbose(void) { return getenv("VERBOSE") != NULL; }
+
 /* 2 MB alignment for each gpm_alloc slice (matches devdax page granularity) */
 #define GPM_ALLOC_ALIGN (2UL * 1024 * 1024)
 
@@ -52,8 +55,9 @@ gpm_error_t gpm_init(void)
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    printf("gpm_init: device = %s (compute %d.%d)\n",
-           prop.name, prop.major, prop.minor);
+    if (gpm_verbose())
+        printf("gpm_init: device = %s (compute %d.%d)\n",
+               prop.name, prop.major, prop.minor);
 
     /* Map the entire devdax device once.
      * size=0 tells pmem_map_file to determine the size from the device. */
@@ -69,9 +73,10 @@ gpm_error_t gpm_init(void)
     gpm_devdax_base   = base;
     gpm_devdax_offset = 0;
 
-    printf("gpm_init: devdax base=%p  total=%.1f GB  is_pmem=%d\n",
-           base, (double)gpm_devdax_total / (1024.0 * 1024.0 * 1024.0),
-           gpm_devdax_is_pmem);
+    if (gpm_verbose())
+        printf("gpm_init: devdax base=%p  total=%.1f GB  is_pmem=%d\n",
+               base, (double)gpm_devdax_total / (1024.0 * 1024.0 * 1024.0),
+               gpm_devdax_is_pmem);
 
     if (!gpm_devdax_is_pmem)
         fprintf(stderr, "gpm_init: WARNING - device reports is_pmem=0; "
@@ -133,9 +138,10 @@ gpm_error_t gpm_alloc(gpm_region_t* region, size_t size, const char* tag)
     region->is_pmem   = gpm_devdax_is_pmem;
     region->is_valid  = 1;
 
-    printf("gpm_alloc[%s]: %zu bytes at %p  offset=%zu  is_pmem=%d\n",
-           tag ? tag : "rgn", alloc_size, sub, gpm_devdax_offset,
-           gpm_devdax_is_pmem);
+    if (gpm_verbose())
+        printf("gpm_alloc[%s]: %zu bytes at %p  offset=%zu  is_pmem=%d\n",
+               tag ? tag : "rgn", alloc_size, sub, gpm_devdax_offset,
+               gpm_devdax_is_pmem);
 
     gpm_devdax_offset += alloc_size;
     return GPM_SUCCESS;

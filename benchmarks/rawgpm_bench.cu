@@ -60,6 +60,35 @@ static __device__ __forceinline__ void pm_store16_cs(void *dst, uint4 v)
         : "memory");
 }
 
+/*
+ * Write-through store primitives for Ada Lovelace (sm_89).
+ *
+ * On Ada, volatile stores (st.global.wb) go through the L2 write-back cache.
+ * Multiple warps competing for L2 eviction bandwidth cap aggregate GPU→PM
+ * throughput at ~3.2 GB/s regardless of warp count.
+ *
+ * st.global.wt (write-through) writes to L1 and propagates immediately to
+ * memory without L2 eviction rate limiting the throughput.  This should
+ * allow GPU bandwidth to scale with warp count on Ada, recovering parity
+ * with CPU MOVNTI (which bypasses all cache levels entirely).
+ */
+static __device__ __forceinline__ void pm_store8_wt(void *dst, unsigned long long v)
+{
+    asm volatile(
+        "st.global.wt.u64 [%0], %1;"
+        : : "l"((unsigned long long)dst), "l"(v)
+        : "memory");
+}
+
+static __device__ __forceinline__ void pm_store16_wt(void *dst, uint4 v)
+{
+    asm volatile(
+        "st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+        : : "l"((unsigned long long)dst),
+            "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+        : "memory");
+}
+
 __global__ void k_pm_8b(void *pm_base, uint32_t n_writers, const void *src,
                          uint32_t pages_per_writer)
 {
@@ -134,6 +163,55 @@ __global__ void k_pm_cs128(void *pm_base, uint32_t n_writers, const uint4 *src4,
         #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
             pm_store16_cs(d + lane + k * blockDim.x,
+                          src4[(lane + k * blockDim.x) % N4]);
+    }
+    if (lane == 0) gpm_drain();
+}
+
+/* ── GPU Kernels: write-through variants (Ada L2 bypass) ────────── */
+/*
+ * k_pm_wt8: 8-byte write-through stores, one per warp lane per iteration.
+ *   Should bypass Ada's L2 write-back path, allowing bandwidth to scale
+ *   with warp count unlike the volatile/cs variants.
+ */
+__global__ void k_pm_wt8(void *pm_base, uint32_t n_writers, const void *src,
+                          uint32_t pages_per_writer)
+{
+    uint32_t writer = blockIdx.x;
+    uint32_t lane   = threadIdx.x;
+    if (writer >= n_writers) return;
+
+    char *dst = (char *)pm_base + (uint64_t)writer * pages_per_writer * RAWGPM_PAGE_SIZE;
+    const unsigned long long *s64 = (const unsigned long long *)src;
+    const uint32_t dwords_per_page = RAWGPM_PAGE_SIZE / 8u;
+
+    for (uint32_t p = 0; p < pages_per_writer; p++) {
+        unsigned long long *d = (unsigned long long *)(dst + (uint64_t)p * RAWGPM_PAGE_SIZE);
+        for (uint32_t i = lane; i < dwords_per_page; i += blockDim.x)
+            pm_store8_wt(d + i, s64[i % (RAWGPM_PAGE_SIZE / 8)]);
+    }
+    if (lane == 0) gpm_drain();
+}
+
+/*
+ * k_pm_wt128: 16-byte write-through stores, 8 per lane = 128B per iteration.
+ *   Higher store throughput per warp compared to wt8.
+ */
+__global__ void k_pm_wt128(void *pm_base, uint32_t n_writers, const uint4 *src4,
+                            uint32_t pages_per_writer)
+{
+    uint32_t writer = blockIdx.x;
+    uint32_t lane   = threadIdx.x;
+    if (writer >= n_writers) return;
+
+    const uint32_t N4 = RAWGPM_PAGE_SIZE / 16u;
+    char *dst_base = (char *)pm_base + (uint64_t)writer * pages_per_writer * RAWGPM_PAGE_SIZE;
+
+    for (uint32_t p = 0; p < pages_per_writer; p++) {
+        uint4 *d = (uint4 *)(dst_base + (uint64_t)p * RAWGPM_PAGE_SIZE);
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; k++)
+            pm_store16_wt(d + lane + k * blockDim.x,
                           src4[(lane + k * blockDim.x) % N4]);
     }
     if (lane == 0) gpm_drain();
@@ -416,35 +494,61 @@ int main(void)
         printf("PM0 region : %llu MB at %p  (dax1.0)\n\n",
                (unsigned long long)(RAWGPM_TOTAL_BYTES >> 20), region.addr);
 
-        /* ── (a) CPU→PM single dax1.0 ───────────────────────────── */
-        printf("=== (a) CPU→PM  single dax1.0  [baseline] ===\n");
+        /* ── (a) GPU VRAM→CPU DRAM→PM  single dax1.0 ───────────────
+         * Two-step CPU-path alternative (data originates on GPU):
+         *   Step 1: cudaMemcpy GPU VRAM → CPU DRAM  (single transfer,
+         *           models bringing results back from GPU to host)
+         *   Step 2: N CPU threads pmem_memcpy_persist CPU DRAM → PM
+         *           (N threads is the varying parameter, same as before)
+         * Total time covers both steps end-to-end.
+         *
+         * DDIO ON: default state for CPU-path operation; PCIe writes
+         * land in CPU L3. pmem_memcpy_persist handles flush+drain.
+         * ─────────────────────────────────────────────────────────── */
+        ddio_enable(bus);
+        printf("ddio: DDIO re-enabled for section (a) [CPU-path, DDIO on]\n");
+        printf("=== (a) GPU VRAM→CPU DRAM→PM  single dax1.0  [CPU-path alternative] ===\n");
+        printf("  Step1=cudaMemcpy(GPU→CPU DRAM)  Step2=N threads pmem_memcpy_persist→PM\n");
         printf("  %-12s  %10s  %12s  %8s\n",
                "CPU Threads", "Per-th MB", "MB/s", "Speedup");
         printf("  %-12s  %10s  %12s  %8s\n",
                "------------", "----------", "------------", "--------");
 
-        double cpu1_mbps = -1.0;
+        double ref1_mbps = -1.0;
+
+        /* 1 GB source buffer in GPU VRAM + 1 GB intermediate CPU DRAM buffer */
+        void *d_src_large = NULL;
+        void *cpu_buf     = NULL;
+        if (cudaMalloc(&d_src_large, RAWGPM_TOTAL_BYTES) != cudaSuccess) {
+            fprintf(stderr, "  cudaMalloc d_src_large (1GB) failed — skipping (a)\n");
+            goto skip_a;
+        }
+        cudaMemset(d_src_large, 0xAB, RAWGPM_TOTAL_BYTES);
+        cpu_buf = malloc(RAWGPM_TOTAL_BYTES);
+        if (!cpu_buf) {
+            fprintf(stderr, "  malloc cpu_buf (1GB) failed — skipping (a)\n");
+            cudaFree(d_src_large); d_src_large = NULL;
+            goto skip_a;
+        }
+        memset(cpu_buf, 0, RAWGPM_TOTAL_BYTES);
 
         for (uint32_t ti = 0; ti < CPU_NT_COUNT; ti++) {
             uint32_t nt  = CPU_NT[ti];
             size_t   per = RAWGPM_TOTAL_BYTES / nt;
 
-            void *h_buf = malloc(RAWGPM_TOTAL_BYTES);
-            if (!h_buf) { fprintf(stderr, "  malloc failed nt=%u\n", nt); break; }
-            memset(h_buf, 0xAB, RAWGPM_TOTAL_BYTES);
-
             cpu_worker_arg_t *args = (cpu_worker_arg_t *)malloc(nt * sizeof(*args));
-            pthread_t *tids = (pthread_t *)malloc(nt * sizeof(pthread_t));
-            if (!args || !tids) { free(h_buf); free(args); free(tids); break; }
+            pthread_t        *tids = (pthread_t *)malloc(nt * sizeof(pthread_t));
+            if (!args || !tids) { free(args); free(tids); break; }
 
             for (uint32_t i = 0; i < nt; i++) {
                 args[i].pm_dst    = (char *)region.addr + (size_t)i * per;
-                args[i].src       = (char *)h_buf       + (size_t)i * per;
+                args[i].src       = (char *)cpu_buf     + (size_t)i * per;
                 args[i].len       = per;
-                args[i].numa_node = 1;   /* dax1.0 is on NUMA node 1 */
+                args[i].numa_node = 1;   /* dax1.0 is NUMA 1 */
             }
 
-            /* warm-up */
+            /* warm-up: step1 + step2 */
+            cudaMemcpy(cpu_buf, d_src_large, RAWGPM_TOTAL_BYTES, cudaMemcpyDeviceToHost);
             for (uint32_t i = 0; i < nt; i++)
                 pthread_create(&tids[i], NULL, cpu_pm_worker, &args[i]);
             for (uint32_t i = 0; i < nt; i++)
@@ -453,6 +557,10 @@ int main(void)
             double best_ms = 1e18;
             for (uint32_t r = 0; r < RAWGPM_REPS; r++) {
                 hrtimer_t t; ht_start(&t);
+                /* step 1: GPU VRAM → CPU DRAM */
+                cudaMemcpy(cpu_buf, d_src_large, RAWGPM_TOTAL_BYTES,
+                           cudaMemcpyDeviceToHost);
+                /* step 2: CPU DRAM → PM  (pmem_memcpy_persist includes flush+drain) */
                 for (uint32_t i = 0; i < nt; i++)
                     pthread_create(&tids[i], NULL, cpu_pm_worker, &args[i]);
                 for (uint32_t i = 0; i < nt; i++)
@@ -462,22 +570,31 @@ int main(void)
             }
 
             double mbps = throughput_mbps(best_ms);
-            if (ti == 0) cpu1_mbps = mbps;
-            double speedup = (cpu1_mbps > 0) ? mbps / cpu1_mbps : -1.0;
+            if (ti == 0) ref1_mbps = mbps;
+            double speedup = (ref1_mbps > 0) ? mbps / ref1_mbps : -1.0;
             printf("  %-12u  %10.1f  %12.1f  %7.2fx\n",
                    nt, (double)per / (1024.0 * 1024.0), mbps, speedup);
             fflush(stdout);
-            free(h_buf); free(args); free(tids);
+            free(args); free(tids);
         }
 
+        free(cpu_buf);
+        cudaFree(d_src_large);
+        d_src_large = NULL;
+        skip_a:;
+        ddio_disable(bus);
+        printf("ddio: DDIO re-disabled for section (b) [GPU kernel stores]\n\n");
+
         /* ── (b) GPU→PM single dax1.0 ───────────────────────────── */
-        printf("\n=== (b) GPU→PM  single dax1.0  [baseline] ===\n");
-        printf("  (normalized to 1-CPU-thread: %.1f MB/s)\n", cpu1_mbps);
-        printf("  %-12s  %10s  %12s  %12s  %12s  %12s\n",
-               "Writers", "Per-wr KB", "vol/8B", "cs/16B", "cs/64B", "cs/128B");
-        printf("  %-12s  %10s  %12s  %12s  %12s  %12s\n",
+        printf("\n=== (b) GPU→PM  single dax1.0  [kernel volatile/cs/wt stores] ===\n");
+        printf("  (ref: 1-stream cudaMemcpy GPU→PM: %.1f MB/s)\n", ref1_mbps);
+        printf("  %-12s  %10s  %12s  %12s  %12s  %12s  %12s  %12s\n",
+               "Writers", "Per-wr KB", "vol/8B", "cs/16B", "cs/64B", "cs/128B",
+               "wt/8B", "wt/128B");
+        printf("  %-12s  %10s  %12s  %12s  %12s  %12s  %12s  %12s\n",
                "------------", "----------",
-               "------------", "------------", "------------", "------------");
+               "------------", "------------", "------------", "------------",
+               "------------", "------------");
 
         for (uint32_t ti = 0; ti < GPU_NW_COUNT; ti++) {
             uint32_t nw = GPU_NW[ti];
@@ -506,11 +623,54 @@ int main(void)
             double ms_cs128 = TIMED_KERNEL(
                 k_pm_cs128<<<g, b>>>(region.addr, active_nw,
                                      (const uint4 *)d_src, pages_per_wr));
+            double ms_wt8   = TIMED_KERNEL(
+                k_pm_wt8<<<g, b>>>(region.addr, active_nw, d_src, pages_per_wr));
+            double ms_wt128 = TIMED_KERNEL(
+                k_pm_wt128<<<g, b>>>(region.addr, active_nw,
+                                     (const uint4 *)d_src, pages_per_wr));
 
-            printf("  %-12u  %10u  %12.1f  %12.1f  %12.1f  %12.1f\n",
+            printf("  %-12u  %10u  %12.1f  %12.1f  %12.1f  %12.1f  %12.1f  %12.1f\n",
                    active_nw, pages_per_wr * RAWGPM_PAGE_SIZE / 1024u,
                    throughput_mbps(ms_vol),  throughput_mbps(ms_cs),
-                   throughput_mbps(ms_cs64), throughput_mbps(ms_cs128));
+                   throughput_mbps(ms_cs64), throughput_mbps(ms_cs128),
+                   throughput_mbps(ms_wt8),  throughput_mbps(ms_wt128));
+            fflush(stdout);
+        }
+
+        /* ── (b2) GPU→PM single dax1.0 [8 threads per writer] ──────
+         * Same as (b) but blockDim = 8 instead of 32.
+         * Only vol/8B and cs/16B are run — the unrolled cs128/wt128
+         * kernels require blockDim.x == 32 to cover a full page.
+         * ─────────────────────────────────────────────────────────── */
+        printf("\n=== (b2) GPU→PM  single dax1.0  [8 threads per writer] ===\n");
+        printf("  %-12s  %10s  %12s  %12s\n",
+               "Writers", "Per-wr KB", "vol/8B", "cs/16B");
+        printf("  %-12s  %10s  %12s  %12s\n",
+               "------------", "----------", "------------", "------------");
+
+        for (uint32_t ti = 0; ti < GPU_NW_COUNT; ti++) {
+            uint32_t nw = GPU_NW[ti];
+            uint64_t total_pages  = RAWGPM_TOTAL_BYTES / RAWGPM_PAGE_SIZE;
+            uint32_t pages_per_wr = (uint32_t)(total_pages / nw);
+            if (pages_per_wr == 0) pages_per_wr = 1;
+            uint32_t active_nw    = (uint32_t)(total_pages / pages_per_wr);
+            if (active_nw > nw) active_nw = nw;
+
+            uint32_t g = active_nw, b = 8u;   /* 8 threads per writer */
+
+            /* warm-up */
+            k_pm_8b<<<g, b>>>(region.addr, active_nw, d_src, pages_per_wr);
+            cudaDeviceSynchronize();
+
+            double ms_vol = TIMED_KERNEL(
+                k_pm_8b<<<g, b>>>(region.addr, active_nw, d_src, pages_per_wr));
+            double ms_cs  = TIMED_KERNEL(
+                k_pm_cs<<<g, b>>>(region.addr, active_nw,
+                                  (const uint4 *)d_src, pages_per_wr));
+
+            printf("  %-12u  %10u  %12.1f  %12.1f\n",
+                   active_nw, pages_per_wr * RAWGPM_PAGE_SIZE / 1024u,
+                   throughput_mbps(ms_vol), throughput_mbps(ms_cs));
             fflush(stdout);
         }
 
@@ -606,7 +766,7 @@ int main(void)
 
             double agg = dual_throughput_mbps(best_ms);
             printf("  %-12u  %10u  %12.1f  %11.2fx\n",
-                   nt, n_per_dev, agg, (cpu1_mbps > 0) ? agg / cpu1_mbps : -1.0);
+                   nt, n_per_dev, agg, (ref1_mbps > 0) ? agg / ref1_mbps : -1.0);
             fflush(stdout);
             free(h_buf); free(args); free(tids);
         }

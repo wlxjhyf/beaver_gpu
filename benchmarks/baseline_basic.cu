@@ -1,31 +1,16 @@
 /*
- * baseline_basic.cu — "Basic" baseline: CPU manages PM, GPU data staged via
- * cudaMemcpy then written to ext4-dax on /dev/pmem0 by a single CPU thread.
+ * baseline_basic.cu — "Basic" baseline: strict GPU→CPU DRAM→PM pipeline.
  *
- * Data path:
- *   GPU device memory  →  cudaMemcpy D→H  →  CPU pinned buffer
- *                      →  pwrite() to ext4-dax file
- *                      →  fdatasync() (CLWB+SFENCE, flushes CPU cache → PM)
- *                      →  PM (/dev/pmem0)
+ * Data path (strict, timed end-to-end):
+ *   GPU VRAM --(pageable cudaMemcpy)--> CPU DRAM --(pwrite+fdatasync)--> PM
  *
- * Without fdatasync, pwrite() to ext4-dax only fills CPU cache (not PM).
- * fdatasync() issues CLWB+SFENCE making data durable on PM media.
+ * The cudaMemcpy (nthreads × 128 KiB, pageable DeviceToHost) is included
+ * in the timing window to represent the real cost of moving GPU data to CPU.
+ * Each worker writes from its own distinct slice of the staging buffer so
+ * the GPU-side data is unique per file (no token-copy tricks).
  *
- * Timing (global, host-side clock_gettime):
- *   START: before cudaMemcpy (simulates end of GPU compute, start of persist)
- *   STOP : after fdatasync() returns (data is durable on PM)
- *
- * Each of N logical "threads" corresponds to one pwrite() call of
- * MB_DATA_PER_THREAD bytes at its designated offset.  All writes are
- * issued sequentially from a single CPU thread — this is the fundamental
- * bottleneck that Basic exhibits at large N.
- *
- * MB_SEQ  : pre-created single large file, N writes at consecutive offsets.
- * MB_RAND : pre-created single large file, N writes at pseudo-random offsets.
- * MB_MULTI: N files, opened + written + closed sequentially (includes
- *           open/close metadata overhead, showing CPU metadata bottleneck).
- *
- * Run: sudo (inherits from microbench main).
+ * Thread model: workers = min(nthreads, NUMA-0 CPU count).
+ * All workers bind to NUMA-0 (Socket 2, where /mnt/pmem lives).
  */
 
 #include "bench_config.h"
@@ -36,6 +21,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,155 +30,335 @@
 
 /* ── Module state ────────────────────────────────────────────────── */
 
-static uint8_t *g_staging = NULL;   /* pinned host buffer, MB_DATA_PER_THREAD */
-static uint8_t *g_devbuf  = NULL;   /* device-side mirror (GPU fills this)    */
+/* Pageable staging buffer: MB_TOTAL_FILES × MB_DATA_PER_THREAD = 512 MiB.
+ * Pageable DeviceToHost cudaMemcpy (~1.3 GB/s) models the true cost of moving
+ * GPU-generated data to CPU before writing to PM. */
+static uint8_t *g_staging = NULL;   /* pageable CPU staging, MB_TOTAL_FILES × 128 KiB */
+static uint8_t *g_devbuf  = NULL;   /* GPU source, same size                          */
+
+/* ── NUMA-0 cpuset (/mnt/pmem is on Socket 2 = NUMA node 0) ─────── */
+
+static cpu_set_t g_numa0_cpuset;
+static int       g_numa0_valid = 0;
+
+static void basic_cpuset_init(void)
+{
+    CPU_ZERO(&g_numa0_cpuset);
+    FILE *f = fopen("/sys/devices/system/node/node0/cpulist", "r");
+    if (!f) return;
+    char buf[512];
+    if (!fgets(buf, sizeof buf, f)) { fclose(f); return; }
+    fclose(f);
+    for (char *p = buf; *p && *p != '\n'; ) {
+        int lo = (int)strtol(p, &p, 10);
+        if (*p == '-') {
+            ++p;
+            int hi = (int)strtol(p, &p, 10);
+            for (int c = lo; c <= hi; c++) CPU_SET(c, &g_numa0_cpuset);
+        } else {
+            CPU_SET(lo, &g_numa0_cpuset);
+        }
+        if (*p == ',') ++p;
+    }
+    g_numa0_valid = (CPU_COUNT(&g_numa0_cpuset) > 0);
+    fprintf(stderr, "[Basic] NUMA-0 cpuset: %d CPUs  (binding workers to Socket 2)\n",
+            g_numa0_valid ? CPU_COUNT(&g_numa0_cpuset) : 0);
+}
+
+/* Number of parallel workers: min(nthreads, NUMA-0 CPU count) */
+static uint32_t basic_nworkers(uint32_t nthreads)
+{
+    uint32_t hw = g_numa0_valid ? (uint32_t)CPU_COUNT(&g_numa0_cpuset) : 48u;
+    return (nthreads < hw) ? nthreads : hw;
+}
+
+/* ── File path helper ────────────────────────────────────────────── */
+
+static inline void make_path(char *buf, size_t sz, uint32_t idx)
+{
+    snprintf(buf, sz, MB_FILE_FMT, idx);
+}
+
+/* ── Pre-create N files, each MB_DATA_PER_THREAD bytes (not timed) ─ */
+
+static void precreate_files(uint32_t n)
+{
+    char path[256];
+    for (uint32_t i = 0; i < n; i++) {
+        make_path(path, sizeof path, i);
+        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd >= 0) { ftruncate(fd, (off_t)MB_DATA_PER_THREAD); close(fd); }
+    }
+}
+
+static void unlink_files(uint32_t n)
+{
+    char path[256];
+    for (uint32_t i = 0; i < n; i++) {
+        make_path(path, sizeof path, i);
+        unlink(path);
+    }
+}
+
+/* ── Work partition helper ───────────────────────────────────────── */
+
+/* Divide nthreads files evenly among nw workers (fair residual distribution) */
+static void divide_work(uint32_t nthreads, uint32_t nw,
+                        uint32_t *starts, uint32_t *counts)
+{
+    uint32_t base = 0;
+    for (uint32_t i = 0; i < nw; i++) {
+        counts[i] = (nthreads - base) / (nw - i);
+        starts[i] = base;
+        base += counts[i];
+    }
+}
+
+/* ── SEQ worker: open(existing) + pwrite + fdatasync + close ─────── */
+
+typedef struct {
+    const uint8_t *src_base;  /* base of staging buffer; per-file offset = i * MB_DATA_PER_THREAD */
+    uint32_t       file_start;
+    uint32_t       file_count;
+} basic_seq_arg_t;
+
+static void *basic_seq_worker(void *a_)
+{
+    basic_seq_arg_t *a = (basic_seq_arg_t *)a_;
+    if (g_numa0_valid)
+        pthread_setaffinity_np(pthread_self(),
+                               sizeof g_numa0_cpuset, &g_numa0_cpuset);
+    char path[256];
+    for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
+        const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
+        make_path(path, sizeof path, i);
+        int fd = open(path, O_RDWR);
+        if (fd < 0) { perror("[Basic/Seq] open"); continue; }
+        pwrite(fd, src, MB_DATA_PER_THREAD, 0);
+        fdatasync(fd);
+        close(fd);
+    }
+    return NULL;
+}
+
+/* ── RAND worker: open(existing) + pwrite pages in random order ──── */
+
+typedef struct {
+    const uint8_t *src_base;
+    uint32_t       file_start;
+    uint32_t       file_count;
+} basic_rand_arg_t;
+
+static void *basic_rand_worker(void *a_)
+{
+    basic_rand_arg_t *a = (basic_rand_arg_t *)a_;
+    if (g_numa0_valid)
+        pthread_setaffinity_np(pthread_self(),
+                               sizeof g_numa0_cpuset, &g_numa0_cpuset);
+    char path[256];
+    uint32_t order[MB_WRITES_PER_THREAD];
+
+    for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
+        const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
+        /* Build same random page order as Beaver rand kernel */
+        for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++) order[p] = p;
+        uint32_t rng = i * 2654435761u + 1u;
+        for (uint32_t p = MB_WRITES_PER_THREAD - 1; p > 0; p--) {
+            rng = rng * 1664525u + 1013904223u;
+            uint32_t j = rng % (p + 1);
+            uint32_t tmp = order[p]; order[p] = order[j]; order[j] = tmp;
+        }
+
+        make_path(path, sizeof path, i);
+        int fd = open(path, O_RDWR);
+        if (fd < 0) { perror("[Basic/Rand] open"); continue; }
+        for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
+            pwrite(fd, src + (size_t)order[p] * MB_PAGE_SIZE, MB_PAGE_SIZE,
+                   (off_t)order[p] * MB_PAGE_SIZE);
+        fdatasync(fd);
+        close(fd);
+    }
+    return NULL;
+}
+
+/* ── MULTI worker: create + pwrite + fdatasync + close ──────────── */
+
+typedef struct {
+    const uint8_t *src_base;
+    uint32_t       file_start;
+    uint32_t       file_count;
+} basic_multi_arg_t;
+
+static void *basic_multi_worker(void *a_)
+{
+    basic_multi_arg_t *a = (basic_multi_arg_t *)a_;
+    if (g_numa0_valid)
+        pthread_setaffinity_np(pthread_self(),
+                               sizeof g_numa0_cpuset, &g_numa0_cpuset);
+    char path[256];
+    for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
+        const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
+        make_path(path, sizeof path, i);
+        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) { perror("[Basic/Multi] open"); continue; }
+        pwrite(fd, src, MB_DATA_PER_THREAD, 0);
+        fdatasync(fd);
+        close(fd);
+    }
+    return NULL;
+}
+
+/* ── Generic parallel launcher ───────────────────────────────────── */
+
+static void launch_workers(void *(*fn)(void *), void *args, size_t arg_sz,
+                            uint32_t nw)
+{
+    pthread_t *tids = (pthread_t *)malloc(nw * sizeof(pthread_t));
+    for (uint32_t i = 0; i < nw; i++)
+        pthread_create(&tids[i], NULL, fn, (char *)args + i * arg_sz);
+    for (uint32_t i = 0; i < nw; i++)
+        pthread_join(tids[i], NULL);
+    free(tids);
+}
 
 /* ── Init / cleanup ──────────────────────────────────────────────── */
 
 int basic_init(void)
 {
-    if (cudaMallocHost((void **)&g_staging, MB_DATA_PER_THREAD) != cudaSuccess) {
-        fprintf(stderr, "[Basic] cudaMallocHost failed\n");
-        return -1;
+    basic_cpuset_init();
+    size_t total = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;  /* 4096 × 128 KiB = 512 MiB */
+    g_staging = (uint8_t *)malloc(total);
+    if (!g_staging) { fprintf(stderr, "[Basic] malloc staging failed\n"); return -1; }
+    if (cudaMalloc((void **)&g_devbuf, total) != cudaSuccess) {
+        fprintf(stderr, "[Basic] cudaMalloc devbuf failed\n");
+        free(g_staging); g_staging = NULL; return -1;
     }
-    if (cudaMalloc((void **)&g_devbuf, MB_DATA_PER_THREAD) != cudaSuccess) {
-        fprintf(stderr, "[Basic] cudaMalloc failed\n");
-        return -1;
-    }
-    /* Pre-fill with a constant pattern — content doesn't affect throughput */
-    memset(g_staging, 0xAB, MB_DATA_PER_THREAD);
-    cudaMemcpy(g_devbuf, g_staging, MB_DATA_PER_THREAD, cudaMemcpyHostToDevice);
+    memset(g_staging, 0xAB, total);
+    cudaMemcpy(g_devbuf, g_staging, total, cudaMemcpyHostToDevice);
     return 0;
 }
 
 void basic_cleanup(void)
 {
-    if (g_staging) { cudaFreeHost(g_staging); g_staging = NULL; }
-    if (g_devbuf)  { cudaFree(g_devbuf);      g_devbuf  = NULL; }
-}
-
-/* ── Offset shuffle (LCG, same seed as beaver rand kernel) ──────── */
-
-static void gen_rand_offsets(uint32_t nthreads, off_t *offsets)
-{
-    /* Use same LCG as mb_rand_write_kernel so patterns are comparable */
-    uint32_t rng = 42u;
-    off_t    file_blocks = (off_t)nthreads; /* N regions of MB_DATA_PER_THREAD */
-    for (uint32_t i = 0; i < nthreads; i++) {
-        rng = rng * 1664525u + 1013904223u;
-        offsets[i] = (off_t)(rng % file_blocks) * MB_DATA_PER_THREAD;
-    }
+    if (g_staging) { free(g_staging);    g_staging = NULL; }
+    if (g_devbuf)  { cudaFree(g_devbuf); g_devbuf  = NULL; }
 }
 
 /* ── MB_SEQ ──────────────────────────────────────────────────────── */
 
+/* nthreads = number of CPU workers; total files = MB_TOTAL_FILES (fixed). */
 double basic_run_seq(uint32_t nthreads)
 {
-    off_t total = (off_t)nthreads * MB_DATA_PER_THREAD;
+    precreate_files(MB_TOTAL_FILES);
 
-    /* Pre-create and size the file (not timed) */
-    int fd = open(MB_SEQ_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
-    if (fd < 0) { perror("[Basic/Seq] open"); return -1.0; }
-    if (ftruncate(fd, total) < 0) { perror("[Basic/Seq] ftruncate"); close(fd); return -1.0; }
+    uint32_t nw = basic_nworkers(nthreads);
+    if (getenv("VERBOSE"))
+        fprintf(stderr, "[Basic/Seq]   workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
+
+    /* Full 512 MiB transfer from GPU VRAM each run (pageable DeviceToHost) */
+    size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
+
+    basic_seq_arg_t *args   = (basic_seq_arg_t *)malloc(nw * sizeof *args);
+    uint32_t        *starts = (uint32_t *)malloc(nw * sizeof *starts);
+    uint32_t        *counts = (uint32_t *)malloc(nw * sizeof *counts);
+    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
+                                       unlink_files(MB_TOTAL_FILES); return -1.0; }
+    divide_work(MB_TOTAL_FILES, nw, starts, counts);
+    for (uint32_t i = 0; i < nw; i++)
+        args[i] = (basic_seq_arg_t){ g_staging, starts[i], counts[i] };
+
+    /* warm-up (not timed) */
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
+    launch_workers(basic_seq_worker, args, sizeof *args, nw);
 
     mb_timer_t t;
-    /* Simulate GPU→CPU handoff: copy one page-worth from device (negligible time) */
-    cudaMemcpy(g_staging, g_devbuf, MB_PAGE_SIZE, cudaMemcpyDeviceToHost);
     mb_timer_start(&t);
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);  /* GPU→DRAM */
+    launch_workers(basic_seq_worker, args, sizeof *args, nw);        /* DRAM→PM  */
+    double ms = mb_timer_elapsed_ms(&t);
 
-    int failed = 0;
-    for (uint32_t i = 0; i < nthreads; i++) {
-        off_t off = (off_t)i * MB_DATA_PER_THREAD;
-        if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, off) < 0) {
-            perror("[Basic/Seq] pwrite"); failed = 1; break;
-        }
-    }
-    /* One fdatasync after all writes: flushes CPU cache → PM (CLWB+SFENCE) */
-    fdatasync(fd);
-
-    double ms = failed ? -1.0 : mb_timer_elapsed_ms(&t);
-    close(fd);
-    unlink(MB_SEQ_FILE);
-    return ms;
+    free(args); free(starts); free(counts);
+    unlink_files(MB_TOTAL_FILES);
+    return mb_throughput(ms);
 }
 
 /* ── MB_RAND ─────────────────────────────────────────────────────── */
 
 double basic_run_rand(uint32_t nthreads)
 {
-    off_t total = (off_t)nthreads * MB_DATA_PER_THREAD;
+    precreate_files(MB_TOTAL_FILES);
 
-    int fd = open(MB_RAND_FILE, O_CREAT | O_RDWR | O_TRUNC, 0644);
-    if (fd < 0) { perror("[Basic/Rand] open"); return -1.0; }
-    if (ftruncate(fd, total) < 0) { perror("[Basic/Rand] ftruncate"); close(fd); return -1.0; }
+    uint32_t nw = basic_nworkers(nthreads);
+    if (getenv("VERBOSE"))
+        fprintf(stderr, "[Basic/Rand]  workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
 
-    off_t *offsets = (off_t *)malloc(nthreads * sizeof(off_t));
-    if (!offsets) { close(fd); return -1.0; }
-    gen_rand_offsets(nthreads, offsets);
+    size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
+
+    basic_rand_arg_t *args   = (basic_rand_arg_t *)malloc(nw * sizeof *args);
+    uint32_t         *starts = (uint32_t *)malloc(nw * sizeof *starts);
+    uint32_t         *counts = (uint32_t *)malloc(nw * sizeof *counts);
+    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
+                                       unlink_files(MB_TOTAL_FILES); return -1.0; }
+    divide_work(MB_TOTAL_FILES, nw, starts, counts);
+    for (uint32_t i = 0; i < nw; i++)
+        args[i] = (basic_rand_arg_t){ g_staging, starts[i], counts[i] };
+
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
+    launch_workers(basic_rand_worker, args, sizeof *args, nw);
 
     mb_timer_t t;
-    cudaMemcpy(g_staging, g_devbuf, MB_PAGE_SIZE, cudaMemcpyDeviceToHost);
     mb_timer_start(&t);
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
+    launch_workers(basic_rand_worker, args, sizeof *args, nw);
+    double ms = mb_timer_elapsed_ms(&t);
 
-    int failed = 0;
-    for (uint32_t i = 0; i < nthreads; i++) {
-        if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, offsets[i]) < 0) {
-            perror("[Basic/Rand] pwrite"); failed = 1; break;
-        }
-    }
-    fdatasync(fd);
-
-    double ms = failed ? -1.0 : mb_timer_elapsed_ms(&t);
-    free(offsets);
-    close(fd);
-    unlink(MB_RAND_FILE);
-    return ms;
+    free(args); free(starts); free(counts);
+    unlink_files(MB_TOTAL_FILES);
+    return mb_throughput(ms);
 }
 
 /* ── MB_MULTI ────────────────────────────────────────────────────── */
-/*
- * For multi-file, timing includes open() + pwrite() + close() for each file,
- * making CPU metadata overhead (N syscall pairs) visible in the results.
- */
+
 double basic_run_multi(uint32_t nthreads)
 {
-    char path[256];
+    uint32_t nw = basic_nworkers(nthreads);
+    if (getenv("VERBOSE"))
+        fprintf(stderr, "[Basic/Multi] workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
+
+    size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
+
+    basic_multi_arg_t *args   = (basic_multi_arg_t *)malloc(nw * sizeof *args);
+    uint32_t          *starts = (uint32_t *)malloc(nw * sizeof *starts);
+    uint32_t          *counts = (uint32_t *)malloc(nw * sizeof *counts);
+    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
+                                       return -1.0; }
+    divide_work(MB_TOTAL_FILES, nw, starts, counts);
+    for (uint32_t i = 0; i < nw; i++)
+        args[i] = (basic_multi_arg_t){ g_staging, starts[i], counts[i] };
+
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
+    launch_workers(basic_multi_worker, args, sizeof *args, nw);
+    unlink_files(MB_TOTAL_FILES);
 
     mb_timer_t t;
-    cudaMemcpy(g_staging, g_devbuf, MB_PAGE_SIZE, cudaMemcpyDeviceToHost);
     mb_timer_start(&t);
-
-    for (uint32_t i = 0; i < nthreads; i++) {
-        snprintf(path, sizeof path, MB_FILE_FMT, i);
-        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (fd < 0) { perror("[Basic/Multi] open"); break; }
-        if (pwrite(fd, g_staging, MB_DATA_PER_THREAD, 0) < 0)
-            perror("[Basic/Multi] pwrite");
-        fdatasync(fd);   /* flush this file's data to PM before close */
-        close(fd);
-    }
-
+    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
+    launch_workers(basic_multi_worker, args, sizeof *args, nw);
     double ms = mb_timer_elapsed_ms(&t);
 
-    /* Cleanup files (not timed) */
-    for (uint32_t i = 0; i < nthreads; i++) {
-        snprintf(path, sizeof path, MB_FILE_FMT, i);
-        unlink(path);
-    }
-    return ms;
+    free(args); free(starts); free(counts);
+    unlink_files(MB_TOTAL_FILES);
+    return mb_throughput(ms);
 }
 
 /* ── Dispatch ────────────────────────────────────────────────────── */
 
 double basic_run(mb_workload_t wl, uint32_t nthreads)
 {
-    double ms;
     switch (wl) {
-    case MB_SEQ:   ms = basic_run_seq  (nthreads); break;
-    case MB_RAND:  ms = basic_run_rand (nthreads); break;
-    case MB_MULTI: ms = basic_run_multi(nthreads); break;
+    case MB_SEQ:   return basic_run_seq  (nthreads);
+    case MB_RAND:  return basic_run_rand (nthreads);
+    case MB_MULTI: return basic_run_multi(nthreads);
     default:       return -1.0;
     }
-    if (ms < 0.0) return -1.0;
-    return mb_throughput(nthreads, ms);
 }

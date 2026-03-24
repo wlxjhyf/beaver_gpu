@@ -14,6 +14,7 @@
 
 #include "gpu_f2fs.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <cuda_runtime.h>
 
@@ -490,11 +491,12 @@ gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t     *fs,
     }
 
     fs->is_initialized = 1;
-    printf("gpu_f2fs_init: %u inodes  data_cache=%u holders  mode=%s\n"
-           "  inode_shadow=%p  log_entries=%p\n",
-           max_inodes, data_cache->max_holders,
-           use_cow ? "COW" : "Checkpoint",
-           (void *)fs->inode_shadow, (void *)fs->log.entries);
+    if (getenv("VERBOSE"))
+        printf("gpu_f2fs_init: %u inodes  data_cache=%u holders  mode=%s\n"
+               "  inode_shadow=%p  log_entries=%p\n",
+               max_inodes, data_cache->max_holders,
+               use_cow ? "COW" : "Checkpoint",
+               (void *)fs->inode_shadow, (void *)fs->log.entries);
     return GPU_F2FS_OK;
 
 err_kernel:

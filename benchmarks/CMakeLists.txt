@@ -35,6 +35,13 @@ set_target_properties(microbench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+# Allow overriding MB_BEAVER_WARPS at configure time:
+#   cmake -DMB_BEAVER_WARPS=4 ..
+if(DEFINED MB_BEAVER_WARPS)
+    target_compile_definitions(microbench PRIVATE MB_BEAVER_WARPS=${MB_BEAVER_WARPS})
+    message(STATUS "microbench: MB_BEAVER_WARPS=${MB_BEAVER_WARPS}")
+endif()
+
 # ── rawgpm_bench (Phase A: raw GPU→PM bandwidth ceiling) ─────────────
 add_executable(rawgpm_bench
     rawgpm_bench.cu

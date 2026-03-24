@@ -174,16 +174,19 @@ static double cufile_write_file(const char *path, off_t file_size,
 
 /* ── MB_SEQ ──────────────────────────────────────────────────────── */
 
+/* cuFile is single-threaded CPU-side; nthreads param ignored.
+ * Always writes MB_TOTAL_FILES × MB_DATA_PER_THREAD to a single file. */
 double cufile_run_seq(uint32_t nthreads)
 {
 #if !CUFILE_AVAILABLE
-    return -1.0;
+    (void)nthreads; return -1.0;
 #else
+    (void)nthreads;
     if (!g_cf_open) return -1.0;
-    off_t total = (off_t)nthreads * MB_DATA_PER_THREAD;
-    double ms = cufile_write_file(MB_SEQ_FILE, total, NULL, nthreads);
+    off_t total = (off_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
+    double ms = cufile_write_file(MB_SEQ_FILE, total, NULL, MB_TOTAL_FILES);
     if (ms < 0.0) return -1.0;
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 #endif
 }
 
@@ -192,39 +195,36 @@ double cufile_run_seq(uint32_t nthreads)
 double cufile_run_rand(uint32_t nthreads)
 {
 #if !CUFILE_AVAILABLE
-    return -1.0;
+    (void)nthreads; return -1.0;
 #else
+    (void)nthreads;
     if (!g_cf_open) return -1.0;
-    off_t total = (off_t)nthreads * MB_DATA_PER_THREAD;
-    off_t *offsets = (off_t *)malloc(nthreads * sizeof(off_t));
+    off_t total = (off_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
+    off_t *offsets = (off_t *)malloc(MB_TOTAL_FILES * sizeof(off_t));
     if (!offsets) return -1.0;
-    gen_rand_offsets_cf(nthreads, offsets);
-
-    /* Use same file name; rand offsets are within same total size */
-    double ms = cufile_write_file(MB_RAND_FILE, total, offsets, nthreads);
+    gen_rand_offsets_cf(MB_TOTAL_FILES, offsets);
+    double ms = cufile_write_file(MB_RAND_FILE, total, offsets, MB_TOTAL_FILES);
     free(offsets);
     if (ms < 0.0) return -1.0;
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 #endif
 }
 
 /* ── MB_MULTI ────────────────────────────────────────────────────── */
-/*
- * N files: open + cuFileHandleRegister + cuFileWrite + cuFileHandleDeregister + close per file.
- * Timing covers all of this (CPU metadata overhead per file is visible).
- */
+
 double cufile_run_multi(uint32_t nthreads)
 {
 #if !CUFILE_AVAILABLE
-    return -1.0;
+    (void)nthreads; return -1.0;
 #else
+    (void)nthreads;
     if (!g_cf_open) return -1.0;
 
     char path[256];
     mb_timer_t t;
     mb_timer_start(&t);
 
-    for (uint32_t i = 0; i < nthreads; i++) {
+    for (uint32_t i = 0; i < MB_TOTAL_FILES; i++) {
         snprintf(path, sizeof path, MB_FILE_FMT, i);
 
         int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
@@ -252,12 +252,11 @@ double cufile_run_multi(uint32_t nthreads)
 
     double ms = mb_timer_elapsed_ms(&t);
 
-    /* Cleanup (not timed) */
-    for (uint32_t i = 0; i < nthreads; i++) {
+    for (uint32_t i = 0; i < MB_TOTAL_FILES; i++) {
         snprintf(path, sizeof path, MB_FILE_FMT, i);
         unlink(path);
     }
-    return mb_throughput(nthreads, ms);
+    return mb_throughput(ms);
 #endif
 }
 
