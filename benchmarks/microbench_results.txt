@@ -1,5 +1,4 @@
 [Basic] NUMA-0 cpuset: 24 CPUs  (binding workers to Socket 2)
-[pmem] NUMA-0 cpuset: 24 CPUs  (binding workers to Socket 2)
 ============================================================
    beaver_gpu  Microbenchmark  (GoFS §4.1/4.2 aligned)
 ============================================================
@@ -16,44 +15,52 @@ Workload parameters:
   CPU Workers      : 1, 4, 8, 12, 16, 24
   Beaver           : 2048 GPU warp(s), each handles ~2 files serially
   Metric           : aggregate throughput (MB/s), same data for all rows
-  pwrite+fsync     : GPU VRAM→(pageable cudaMemcpy)→DRAM→pwrite+fdatasync→PM
-  pmem_persist     : GPU VRAM→(pageable cudaMemcpy)→DRAM→MOVNTI+SFENCE→PM
-  cuFile           : GPU VRAM→cuFileWrite(GDS, serial)→ext4-dax→PM
-  Beaver(GPU)      : GPU kernel→GPM direct stores→PM (no CPU involvement)
+  pwrite+rename    : GPU VRAM→cudaMemcpy→DRAM→open(tmp)+pwrite×32+fsync→rename→fsync(dir)→PM
+  cuFile           : GPU VRAM→cuFileWrite(GDS)→ext4-dax→PM
+  Beaver(GPU)      : GPU kernel→vfs_create+write×32+vfs_fsync→GPM→PM
+  All methods time full file lifecycle: create + write + crash-consistent persist.
+  pwrite+rename: write-then-rename guarantees same atomicity as Beaver COW.
+  pmem_persist removed: bypasses VFS entirely (no inode/dentry), not comparable.
   (run with -v or VERBOSE=1 to see diagnostic output)
 
 ### SeqWrite ###
-  32 writes/thread × 4096 B  —  timing: task-start to task-complete
-  CPU Workers     pwrite+fsync    pmem_persist        cuFile   Beaver(GPU)
-  ------------  --------------  --------------  ------------  ------------
-  1                      976.1          1486.5        1182.1        1307.4
-  4                     1587.7          1685.6        1185.0        1256.4
-  8                     1436.9          1377.2        1180.8        1259.2
-  12                    1318.7          1173.3        1010.9        1249.1
-  16                    1205.2          1066.4         931.4        1229.1
-  24                    1055.9          1086.7        1067.2        1238.5
+  32 writes/file × 4096 B  —  timing: create+write+crash-consistent-persist
+  CPU Workers    pwrite+rename        cuFile   Beaver(GPU)
+  ------------  --------------  ------------  ------------
+  1                      175.8         163.8        1276.6
+  4                      526.9         390.8        1289.9
+  8                      569.6         679.7        1252.7
+  12                     633.3         897.0        1306.0
+  16                     664.0        1045.4        1276.5
+  24                     678.3        1221.7        1271.6
 
 ### RandWrite ###
-  32 writes/thread × 4096 B  —  timing: task-start to task-complete
-  CPU Workers     pwrite+fsync    pmem_persist        cuFile   Beaver(GPU)
-  ------------  --------------  --------------  ------------  ------------
-  1                      713.0          1524.9        1163.1        1261.5
-  4                     1432.8          1702.2        1158.0        1262.4
-  8                     1519.1          1423.8        1054.4        1268.8
-  12                    1383.6          1244.5        1155.0        1264.5
-  16                    1294.1          1088.6         868.1        1280.9
-  24                    1107.9          1102.9        1046.2        1255.4
+  32 writes/file × 4096 B  —  timing: create+write+crash-consistent-persist
+  CPU Workers    pwrite+rename        cuFile   Beaver(GPU)
+  ------------  --------------  ------------  ------------
+  1                      166.5         115.8        1237.6
+  4                      427.2         392.2        1247.9
+  8                      552.6         601.1        1264.1
+  12                     637.7         779.2        1248.8
+  16                     663.8         892.9        1264.6
+  24                     641.5        1005.6        1246.2
 
 ### MultiWrite ###
-  32 writes/thread × 4096 B  —  timing: task-start to task-complete
-  CPU Workers     pwrite+fsync    pmem_persist        cuFile   Beaver(GPU)
-  ------------  --------------  --------------  ------------  ------------
-  1                      358.1          1499.9         960.5        1266.8
-  4                      775.2          1707.1         957.1        1317.6
-  8                      800.2          1489.6         950.6        1271.5
-  12                     718.1          1280.3         954.9        1263.9
-  16                     659.1          1079.1         877.3        1249.3
-  24                     587.7          1096.2         880.1        1265.0
+  32 writes/file × 4096 B  —  timing: create+write+crash-consistent-persist
+  CPU Workers    pwrite+rename        cuFile   Beaver(GPU)
+  ------------  --------------  ------------  ------------
+  1                      172.1         128.0        1289.7
+  4                      435.3         391.1        1236.1
+  8                      568.5         661.7        1229.1
+  12                     627.2         900.7        1257.8
+  16                     657.5        1052.4        1257.9
+  24                     666.0        1202.5        1263.9
+
+### Beaver Raw Data Write (no metadata, no holders, no log) ###
+  2048 warps × 4096 files × 128 KiB, 1 fence/file
+  Compares against full Beaver to isolate metadata overhead.
+  Result        : 1796.5 MB/s
+  Full Beaver   : 1291.9 MB/s  (MultiWrite, 1 worker row)
 
 ============================================================
    Microbenchmark complete.

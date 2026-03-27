@@ -13,9 +13,9 @@ PCIe bus 0x86 — disabling DDIO
 
 ddio: DDIO disabled (GPU bus=0x86)
 gpm_init: device = NVIDIA GeForce RTX 4090 (compute 8.9)
-gpm_init: devdax base=0x7edd40000000  total=496.1 GB  is_pmem=1
-gpm_alloc[rawgpm-dev0]: 1073741824 bytes at 0x7edd40000000  offset=0  is_pmem=1
-PM0 region : 1024 MB at 0x7edd40000000  (dax1.0)
+gpm_init: devdax base=0x7f0140000000  total=496.1 GB  is_pmem=1
+gpm_alloc[rawgpm-dev0]: 1073741824 bytes at 0x7f0140000000  offset=0  is_pmem=1
+PM0 region : 1024 MB at 0x7f0140000000  (dax1.0)
 
 ddio: DDIO enabled (GPU bus=0x86)
 ddio: DDIO re-enabled for section (a) [CPU-path, DDIO on]
@@ -23,41 +23,41 @@ ddio: DDIO re-enabled for section (a) [CPU-path, DDIO on]
   Step1=cudaMemcpy(GPU→CPU DRAM)  Step2=N threads pmem_memcpy_persist→PM
   CPU Threads    Per-th MB          MB/s   Speedup
   ------------  ----------  ------------  --------
-  1                 1024.0        1428.2     1.00x
-  2                  512.0        1524.5     1.07x
-  4                  256.0        1462.9     1.02x
-  8                  128.0        1189.4     0.83x
-  16                  64.0         984.6     0.69x
-  32                  32.0         933.4     0.65x
-  48                  21.3         933.3     0.65x
+  1                 1024.0        1449.5     1.00x
+  2                  512.0        1537.4     1.06x
+  4                  256.0        1395.0     0.96x
+  8                  128.0        1230.9     0.85x
+  16                  64.0        1012.7     0.70x
+  32                  32.0         972.0     0.67x
+  48                  21.3         955.7     0.66x
 ddio: DDIO disabled (GPU bus=0x86)
 ddio: DDIO re-disabled for section (b) [GPU kernel stores]
 
 
 === (b) GPU→PM  single dax1.0  [kernel volatile/cs/wt stores] ===
-  (ref: 1-stream cudaMemcpy GPU→PM: 1428.2 MB/s)
+  (ref: 1-stream cudaMemcpy GPU→PM: 1449.5 MB/s)
   Writers        Per-wr KB        vol/8B        cs/16B        cs/64B       cs/128B         wt/8B       wt/128B
   ------------  ----------  ------------  ------------  ------------  ------------  ------------  ------------
-  1                1048576        3168.2        3099.4        3118.2        3094.7        3191.4        3189.0
-  2                 524288        2844.3        2923.3        2930.0        2923.6        2854.0        2849.4
-  4                 262144        2451.5        2533.5        2540.7        2544.2        2452.7        2453.3
-  8                 131072        2152.5        2187.7        2192.6        2191.5        2151.7        2155.4
-  16                 65536        2172.9        2177.8        2178.9        2176.8        2171.6        2168.5
-  32                 32768        2117.8        2113.0        2116.1        2117.1        2118.3        2118.9
-  48                 21844        2130.7        2129.4        2131.9        2131.7        2135.8        2139.7
-  128                 8192        2007.0        2003.4        2004.8        2004.6        2006.2        2001.4
+  1                1048576        3196.5        3108.0        3122.8        3129.9        3176.9        3201.0
+  2                 524288        2869.2        2931.5        2938.5        2946.2        2861.5        2864.8
+  4                 262144        2454.7        2553.6        2553.5        2558.1        2463.9        2465.6
+  8                 131072        2163.6        2204.0        2205.7        2209.0        2163.8        2161.6
+  16                 65536        2181.1        2189.7        2187.8        2194.0        2182.6        2182.5
+  32                 32768        2124.7        2125.1        2124.7        2123.7        2123.1        2128.6
+  48                 21844        2142.4        2145.4        2138.7        2134.3        2143.2        2135.9
+  128                 8192        2014.1        2008.4        2007.9        2008.2        2007.9        2010.1
 
 === (b2) GPU→PM  single dax1.0  [8 threads per writer] ===
   Writers        Per-wr KB        vol/8B        cs/16B
   ------------  ----------  ------------  ------------
-  1                1048576        2221.7        3108.9
-  2                 524288        3183.4        2930.2
-  4                 262144        2988.7        2531.2
-  8                 131072        2792.5        2193.7
-  16                 65536        2666.4        2183.6
-  32                 32768        2517.9        2124.1
-  48                 21844        2421.5        2136.6
-  128                 8192        2161.2        2006.4
+  1                1048576        2220.9        3123.7
+  2                 524288        3188.9        2913.9
+  4                 262144        3010.0        2531.0
+  8                 131072        2772.0        2203.6
+  16                 65536        2650.1        2188.2
+  32                 32768        2456.6        2122.2
+  48                 21844        2423.0        2134.9
+  128                 8192        2150.8        2012.9
 
 [dual] pmem_map_file(/dev/dax0.0) failed: open /dev/dax0.0: No such file or directory
        Skipping sections (c) and (d).

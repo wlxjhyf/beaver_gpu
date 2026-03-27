@@ -79,16 +79,11 @@ static inline void make_path(char *buf, size_t sz, uint32_t idx)
     snprintf(buf, sz, MB_FILE_FMT, idx);
 }
 
-/* ── Pre-create N files, each MB_DATA_PER_THREAD bytes (not timed) ─ */
+/* ── Temp path helper (write-then-rename) ────────────────────────── */
 
-static void precreate_files(uint32_t n)
+static inline void make_tmp_path(char *buf, size_t sz, uint32_t idx)
 {
-    char path[256];
-    for (uint32_t i = 0; i < n; i++) {
-        make_path(path, sizeof path, i);
-        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (fd >= 0) { ftruncate(fd, (off_t)MB_DATA_PER_THREAD); close(fd); }
-    }
+    snprintf(buf, sz, MB_PMEM_MOUNT "/mb_%06u.tmp", idx);
 }
 
 static void unlink_files(uint32_t n)
@@ -97,6 +92,8 @@ static void unlink_files(uint32_t n)
     for (uint32_t i = 0; i < n; i++) {
         make_path(path, sizeof path, i);
         unlink(path);
+        make_tmp_path(path, sizeof path, i);
+        unlink(path);  /* clean up any leftover tmp files */
     }
 }
 
@@ -114,96 +111,68 @@ static void divide_work(uint32_t nthreads, uint32_t nw,
     }
 }
 
-/* ── SEQ worker: open(existing) + pwrite + fdatasync + close ─────── */
-
-typedef struct {
-    const uint8_t *src_base;  /* base of staging buffer; per-file offset = i * MB_DATA_PER_THREAD */
-    uint32_t       file_start;
-    uint32_t       file_count;
-} basic_seq_arg_t;
-
-static void *basic_seq_worker(void *a_)
-{
-    basic_seq_arg_t *a = (basic_seq_arg_t *)a_;
-    if (g_numa0_valid)
-        pthread_setaffinity_np(pthread_self(),
-                               sizeof g_numa0_cpuset, &g_numa0_cpuset);
-    char path[256];
-    for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
-        const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
-        make_path(path, sizeof path, i);
-        int fd = open(path, O_RDWR);
-        if (fd < 0) { perror("[Basic/Seq] open"); continue; }
-        pwrite(fd, src, MB_DATA_PER_THREAD, 0);
-        fdatasync(fd);
-        close(fd);
-    }
-    return NULL;
-}
-
-/* ── RAND worker: open(existing) + pwrite pages in random order ──── */
+/*
+ * Unified worker using write-then-rename for crash consistency.
+ *
+ * Pattern: open(tmp) → pwrite×32 (4KB each) → fsync(tmp) → rename→ fsync(dir)
+ *
+ * This matches Beaver's guarantee: after a crash, the final file either does
+ * not exist or contains complete content — no torn writes possible.
+ * rename() is a POSIX atomic operation; fsync(dir) persists the directory entry.
+ *
+ * Write granularity is aligned with Beaver: 32 × MB_PAGE_SIZE (4KB) per file.
+ */
 
 typedef struct {
     const uint8_t *src_base;
     uint32_t       file_start;
     uint32_t       file_count;
-} basic_rand_arg_t;
+    int            rand_order;   /* 0 = sequential pages, 1 = random page order */
+} basic_worker_arg_t;
 
-static void *basic_rand_worker(void *a_)
+static int g_dir_fd = -1;   /* fd for MB_PMEM_MOUNT directory, for fsync(dir) */
+
+static void *basic_worker(void *a_)
 {
-    basic_rand_arg_t *a = (basic_rand_arg_t *)a_;
+    basic_worker_arg_t *a = (basic_worker_arg_t *)a_;
     if (g_numa0_valid)
         pthread_setaffinity_np(pthread_self(),
                                sizeof g_numa0_cpuset, &g_numa0_cpuset);
-    char path[256];
+
+    char final_path[256], tmp_path[256];
     uint32_t order[MB_WRITES_PER_THREAD];
 
     for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
         const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
-        /* Build same random page order as Beaver rand kernel */
+        make_path    (final_path, sizeof final_path, i);
+        make_tmp_path(tmp_path,   sizeof tmp_path,   i);
+
+        /* Build page order (sequential or random Fisher-Yates, same seed as Beaver) */
         for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++) order[p] = p;
-        uint32_t rng = i * 2654435761u + 1u;
-        for (uint32_t p = MB_WRITES_PER_THREAD - 1; p > 0; p--) {
-            rng = rng * 1664525u + 1013904223u;
-            uint32_t j = rng % (p + 1);
-            uint32_t tmp = order[p]; order[p] = order[j]; order[j] = tmp;
+        if (a->rand_order) {
+            uint32_t rng = i * 2654435761u + 1u;
+            for (uint32_t p = MB_WRITES_PER_THREAD - 1; p > 0; p--) {
+                rng = rng * 1664525u + 1013904223u;
+                uint32_t j = rng % (p + 1);
+                uint32_t tmp = order[p]; order[p] = order[j]; order[j] = tmp;
+            }
         }
 
-        make_path(path, sizeof path, i);
-        int fd = open(path, O_RDWR);
-        if (fd < 0) { perror("[Basic/Rand] open"); continue; }
+        /* write-then-rename: crash-consistent new-file creation */
+        int fd = open(tmp_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) { perror("[Basic] open tmp"); continue; }
+
         for (uint32_t p = 0; p < MB_WRITES_PER_THREAD; p++)
             pwrite(fd, src + (size_t)order[p] * MB_PAGE_SIZE, MB_PAGE_SIZE,
                    (off_t)order[p] * MB_PAGE_SIZE);
-        fdatasync(fd);
+
+        fsync(fd);   /* persist file data + inode size */
         close(fd);
-    }
-    return NULL;
-}
 
-/* ── MULTI worker: create + pwrite + fdatasync + close ──────────── */
+        rename(tmp_path, final_path);   /* atomic directory entry swap */
 
-typedef struct {
-    const uint8_t *src_base;
-    uint32_t       file_start;
-    uint32_t       file_count;
-} basic_multi_arg_t;
-
-static void *basic_multi_worker(void *a_)
-{
-    basic_multi_arg_t *a = (basic_multi_arg_t *)a_;
-    if (g_numa0_valid)
-        pthread_setaffinity_np(pthread_self(),
-                               sizeof g_numa0_cpuset, &g_numa0_cpuset);
-    char path[256];
-    for (uint32_t i = a->file_start; i < a->file_start + a->file_count; i++) {
-        const uint8_t *src = a->src_base + (size_t)i * MB_DATA_PER_THREAD;
-        make_path(path, sizeof path, i);
-        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (fd < 0) { perror("[Basic/Multi] open"); continue; }
-        pwrite(fd, src, MB_DATA_PER_THREAD, 0);
-        fdatasync(fd);
-        close(fd);
+        if (g_dir_fd >= 0)
+            fsync(g_dir_fd);   /* persist directory entry to PM */
     }
     return NULL;
 }
@@ -235,6 +204,11 @@ int basic_init(void)
     }
     memset(g_staging, 0xAB, total);
     cudaMemcpy(g_devbuf, g_staging, total, cudaMemcpyHostToDevice);
+
+    g_dir_fd = open(MB_PMEM_MOUNT, O_RDONLY | O_DIRECTORY);
+    if (g_dir_fd < 0)
+        fprintf(stderr, "[Basic] WARNING: cannot open dir fd for fsync(dir) — "
+                        "directory entries may not be persisted\n");
     return 0;
 }
 
@@ -242,39 +216,45 @@ void basic_cleanup(void)
 {
     if (g_staging) { free(g_staging);    g_staging = NULL; }
     if (g_devbuf)  { cudaFree(g_devbuf); g_devbuf  = NULL; }
+    if (g_dir_fd >= 0) { close(g_dir_fd); g_dir_fd = -1; }
 }
 
-/* ── MB_SEQ ──────────────────────────────────────────────────────── */
-
-/* nthreads = number of CPU workers; total files = MB_TOTAL_FILES (fixed). */
-double basic_run_seq(uint32_t nthreads)
+/* ── Generic run helper ──────────────────────────────────────────── */
+/*
+ * All three workloads now use the same write-then-rename path.
+ * Timing covers: cudaMemcpy(DevToHost) + create-tmp + pwrite×32 +
+ *                fsync(file) + rename + fsync(dir).
+ * This is the full end-to-end cost of crash-consistently writing a new file
+ * from GPU data to PM — equivalent to Beaver's vfs_create+write+fsync path.
+ */
+static double basic_run_impl(uint32_t nthreads, int rand_order, const char *tag)
 {
-    precreate_files(MB_TOTAL_FILES);
-
     uint32_t nw = basic_nworkers(nthreads);
     if (getenv("VERBOSE"))
-        fprintf(stderr, "[Basic/Seq]   workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
+        fprintf(stderr, "[Basic/%s] workers=%-4u  files=%u  rand=%d\n",
+                tag, nw, MB_TOTAL_FILES, rand_order);
 
-    /* Full 512 MiB transfer from GPU VRAM each run (pageable DeviceToHost) */
     size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
 
-    basic_seq_arg_t *args   = (basic_seq_arg_t *)malloc(nw * sizeof *args);
-    uint32_t        *starts = (uint32_t *)malloc(nw * sizeof *starts);
-    uint32_t        *counts = (uint32_t *)malloc(nw * sizeof *counts);
-    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
-                                       unlink_files(MB_TOTAL_FILES); return -1.0; }
+    basic_worker_arg_t *args   = (basic_worker_arg_t *)malloc(nw * sizeof *args);
+    uint32_t           *starts = (uint32_t *)malloc(nw * sizeof *starts);
+    uint32_t           *counts = (uint32_t *)malloc(nw * sizeof *counts);
+    if (!args || !starts || !counts) {
+        free(args); free(starts); free(counts); return -1.0;
+    }
     divide_work(MB_TOTAL_FILES, nw, starts, counts);
     for (uint32_t i = 0; i < nw; i++)
-        args[i] = (basic_seq_arg_t){ g_staging, starts[i], counts[i] };
+        args[i] = (basic_worker_arg_t){ g_staging, starts[i], counts[i], rand_order };
 
     /* warm-up (not timed) */
     cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
-    launch_workers(basic_seq_worker, args, sizeof *args, nw);
+    launch_workers(basic_worker, args, sizeof *args, nw);
+    unlink_files(MB_TOTAL_FILES);
 
     mb_timer_t t;
     mb_timer_start(&t);
     cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);  /* GPU→DRAM */
-    launch_workers(basic_seq_worker, args, sizeof *args, nw);        /* DRAM→PM  */
+    launch_workers(basic_worker, args, sizeof *args, nw);            /* DRAM→PM  */
     double ms = mb_timer_elapsed_ms(&t);
 
     free(args); free(starts); free(counts);
@@ -282,74 +262,11 @@ double basic_run_seq(uint32_t nthreads)
     return mb_throughput(ms);
 }
 
-/* ── MB_RAND ─────────────────────────────────────────────────────── */
+/* ── MB_SEQ / MB_RAND / MB_MULTI ─────────────────────────────────── */
 
-double basic_run_rand(uint32_t nthreads)
-{
-    precreate_files(MB_TOTAL_FILES);
-
-    uint32_t nw = basic_nworkers(nthreads);
-    if (getenv("VERBOSE"))
-        fprintf(stderr, "[Basic/Rand]  workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
-
-    size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
-
-    basic_rand_arg_t *args   = (basic_rand_arg_t *)malloc(nw * sizeof *args);
-    uint32_t         *starts = (uint32_t *)malloc(nw * sizeof *starts);
-    uint32_t         *counts = (uint32_t *)malloc(nw * sizeof *counts);
-    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
-                                       unlink_files(MB_TOTAL_FILES); return -1.0; }
-    divide_work(MB_TOTAL_FILES, nw, starts, counts);
-    for (uint32_t i = 0; i < nw; i++)
-        args[i] = (basic_rand_arg_t){ g_staging, starts[i], counts[i] };
-
-    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
-    launch_workers(basic_rand_worker, args, sizeof *args, nw);
-
-    mb_timer_t t;
-    mb_timer_start(&t);
-    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
-    launch_workers(basic_rand_worker, args, sizeof *args, nw);
-    double ms = mb_timer_elapsed_ms(&t);
-
-    free(args); free(starts); free(counts);
-    unlink_files(MB_TOTAL_FILES);
-    return mb_throughput(ms);
-}
-
-/* ── MB_MULTI ────────────────────────────────────────────────────── */
-
-double basic_run_multi(uint32_t nthreads)
-{
-    uint32_t nw = basic_nworkers(nthreads);
-    if (getenv("VERBOSE"))
-        fprintf(stderr, "[Basic/Multi] workers=%-4u  files=%u\n", nw, MB_TOTAL_FILES);
-
-    size_t xfer = (size_t)MB_TOTAL_FILES * MB_DATA_PER_THREAD;
-
-    basic_multi_arg_t *args   = (basic_multi_arg_t *)malloc(nw * sizeof *args);
-    uint32_t          *starts = (uint32_t *)malloc(nw * sizeof *starts);
-    uint32_t          *counts = (uint32_t *)malloc(nw * sizeof *counts);
-    if (!args || !starts || !counts) { free(args); free(starts); free(counts);
-                                       return -1.0; }
-    divide_work(MB_TOTAL_FILES, nw, starts, counts);
-    for (uint32_t i = 0; i < nw; i++)
-        args[i] = (basic_multi_arg_t){ g_staging, starts[i], counts[i] };
-
-    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
-    launch_workers(basic_multi_worker, args, sizeof *args, nw);
-    unlink_files(MB_TOTAL_FILES);
-
-    mb_timer_t t;
-    mb_timer_start(&t);
-    cudaMemcpy(g_staging, g_devbuf, xfer, cudaMemcpyDeviceToHost);
-    launch_workers(basic_multi_worker, args, sizeof *args, nw);
-    double ms = mb_timer_elapsed_ms(&t);
-
-    free(args); free(starts); free(counts);
-    unlink_files(MB_TOTAL_FILES);
-    return mb_throughput(ms);
-}
+double basic_run_seq  (uint32_t nthreads) { return basic_run_impl(nthreads, 0, "Seq");   }
+double basic_run_rand (uint32_t nthreads) { return basic_run_impl(nthreads, 1, "Rand");  }
+double basic_run_multi(uint32_t nthreads) { return basic_run_impl(nthreads, 0, "Multi"); }
 
 /* ── Dispatch ────────────────────────────────────────────────────── */
 

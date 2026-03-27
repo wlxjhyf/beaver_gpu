@@ -28,10 +28,6 @@ int    basic_init(void);
 void   basic_cleanup(void);
 double basic_run(mb_workload_t wl, uint32_t nthreads);
 
-int    pmem_bench_init(void);
-void   pmem_bench_cleanup(void);
-double pmem_run(mb_workload_t wl, uint32_t nthreads);
-
 int    cufile_init(void);
 void   cufile_cleanup(void);
 double cufile_run(mb_workload_t wl, uint32_t nthreads);
@@ -39,6 +35,7 @@ double cufile_run(mb_workload_t wl, uint32_t nthreads);
 int    beaver_bench_init(void);
 void   beaver_bench_cleanup(void);
 double beaver_run(mb_workload_t wl, uint32_t nthreads);
+double beaver_run_raw_data(void);
 
 /* DDIO helpers from tests/ddio_helper.cpp */
 extern "C" {
@@ -68,10 +65,10 @@ static int check_pmem_mount(void)
 /* ── Run one workload across all thread counts ───────────────────── */
 
 static void run_workload(mb_workload_t wl,
-                          int basic_ok, int pmem_ok, int cufile_ok)
+                          int basic_ok, int cufile_ok)
 {
     printf("\n### %s ###\n", MB_WORKLOAD_NAMES[wl]);
-    printf("  %u writes/thread × %u B  —  timing: task-start to task-complete\n",
+    printf("  %u writes/file × %u B  —  timing: create+write+crash-consistent-persist\n",
            MB_WRITES_PER_THREAD, MB_PAGE_SIZE);
     mb_print_table_header();
 
@@ -79,11 +76,10 @@ static void run_workload(mb_workload_t wl,
         uint32_t nt = MB_THREAD_COUNTS[ti];
 
         double r_basic  = basic_ok  ? basic_run (wl, nt) : -1.0;
-        double r_pmem   = pmem_ok   ? pmem_run  (wl, nt) : -1.0;
         double r_cufile = cufile_ok ? cufile_run(wl, nt) : -1.0;
         double r_beaver =             beaver_run(wl, nt);
 
-        mb_print_row(nt, r_basic, r_pmem, r_cufile, r_beaver);
+        mb_print_row(nt, r_basic, r_cufile, r_beaver);
         fflush(stdout);
     }
 }
@@ -122,21 +118,20 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Check /mnt/pmem0 */
+    /* Check /mnt/pmem */
     int pmem_ok = (check_pmem_mount() == 0);
 
     /* Init each baseline */
-    int basic_ok  = pmem_ok && (basic_init()       == 0);
-    int pmem_b_ok = pmem_ok && (pmem_bench_init()  == 0);
-    int cufile_ok = pmem_ok && (cufile_init()       == 0);
-    int beaver_ok = (beaver_bench_init()            == 0);
+    int basic_ok  = pmem_ok && (basic_init()  == 0);
+    int cufile_ok = pmem_ok && (cufile_init() == 0);
+    int beaver_ok = (beaver_bench_init()      == 0);
 
     if (!basic_ok)
-        fprintf(stdout, "[microbench] pwrite+fsync baseline unavailable (see above).\n");
-    if (!pmem_b_ok)
-        fprintf(stdout, "[microbench] pmem_persist baseline unavailable (see above).\n");
+        fprintf(stdout, "[microbench] pwrite+rename baseline unavailable (see above).\n");
     if (!cufile_ok)
         fprintf(stdout, "[microbench] cuFile baseline unavailable (see above).\n");
+    double r_raw = -1.0;   /* declared before goto to avoid jump-past-init */
+
     if (!beaver_ok) {
         fprintf(stderr, "[microbench] beaver init failed — aborting.\n");
         goto done;
@@ -153,17 +148,32 @@ int main(int argc, char **argv)
            MB_BEAVER_WARPS,
            (MB_TOTAL_FILES + MB_BEAVER_WARPS - 1) / MB_BEAVER_WARPS);
     printf("  Metric           : aggregate throughput (MB/s), same data for all rows\n");
-    printf("  pwrite+fsync     : GPU VRAM→(pageable cudaMemcpy)→DRAM→pwrite+fdatasync→PM\n");
-    printf("  pmem_persist     : GPU VRAM→(pageable cudaMemcpy)→DRAM→MOVNTI+SFENCE→PM\n");
-    printf("  cuFile           : GPU VRAM→cuFileWrite(GDS, serial)→ext4-dax→PM\n");
-    printf("  Beaver(GPU)      : GPU kernel→GPM direct stores→PM (no CPU involvement)\n");
+    printf("  pwrite+rename    : GPU VRAM→cudaMemcpy→DRAM→open(tmp)+pwrite×32+fsync→rename→fsync(dir)→PM\n");
+    printf("  cuFile           : GPU VRAM→cuFileWrite(GDS)→ext4-dax→PM\n");
+    printf("  Beaver(GPU)      : GPU kernel→vfs_create+write×32+vfs_fsync→GPM→PM\n");
+    printf("  All methods time full file lifecycle: create + write + crash-consistent persist.\n");
+    printf("  pwrite+rename: write-then-rename guarantees same atomicity as Beaver COW.\n");
+    printf("  pmem_persist removed: bypasses VFS entirely (no inode/dentry), not comparable.\n");
     if (!verbose)
         printf("  (run with -v or VERBOSE=1 to see diagnostic output)\n");
 
     /* Run the three workloads */
-    run_workload(MB_SEQ,   basic_ok, pmem_b_ok, cufile_ok);
-    run_workload(MB_RAND,  basic_ok, pmem_b_ok, cufile_ok);
-    run_workload(MB_MULTI, basic_ok, pmem_b_ok, cufile_ok);
+    run_workload(MB_SEQ,   basic_ok, cufile_ok);
+    run_workload(MB_RAND,  basic_ok, cufile_ok);
+    run_workload(MB_MULTI, basic_ok, cufile_ok);
+
+    /* ── Raw data write baseline (data only, no metadata) ──────────── */
+    printf("\n### Beaver Raw Data Write (no metadata, no holders, no log) ###\n");
+    printf("  %u warps × %u files × %u KiB, 1 fence/file\n",
+           MB_BEAVER_WARPS, MB_TOTAL_FILES, MB_DATA_PER_THREAD / 1024);
+    printf("  Compares against full Beaver to isolate metadata overhead.\n");
+    r_raw = beaver_run_raw_data();
+    if (r_raw < 0.0)
+        printf("  Result        : N/A (gpm_alloc failed)\n");
+    else
+        printf("  Result        : %.1f MB/s\n", r_raw);
+    printf("  Full Beaver   : %.1f MB/s  (MultiWrite, 1 worker row)\n",
+           beaver_run(MB_MULTI, 1));
 
     printf("\n============================================================\n");
     printf("   Microbenchmark complete.\n");
@@ -171,7 +181,6 @@ int main(int argc, char **argv)
 
 done:
     if (basic_ok)  basic_cleanup();
-    if (pmem_b_ok) pmem_bench_cleanup();
     if (cufile_ok) cufile_cleanup();
     beaver_bench_cleanup();
 

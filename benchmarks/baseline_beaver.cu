@@ -110,9 +110,11 @@ void beaver_bench_cleanup(void)
 
 /* ── MB_SEQ ──────────────────────────────────────────────────────── */
 
-/* Uses MB_BEAVER_WARPS GPU warps; each warp handles
- * ceil(MB_TOTAL_FILES / MB_BEAVER_WARPS) files serially.
- * nthreads parameter is ignored. */
+/*
+ * Timing now covers create + write + fsync, matching the CPU rename path.
+ * Uses mb_multi_write_kernel_loop (create+write in one kernel) for Seq order.
+ * nthreads parameter is ignored — Beaver always uses MB_BEAVER_WARPS warps.
+ */
 double beaver_run_seq(uint32_t nthreads)
 {
     (void)nthreads;
@@ -129,16 +131,16 @@ double beaver_run_seq(uint32_t nthreads)
     if (alloc_hashes(0xA0000000u, n, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
-    /* Setup: create all files in parallel (not timed) */
-    uint32_t grid, blk;
-    mb_grid_block_warp(n, &grid, &blk);
-    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, n);
+    /* warm-up (not timed) */
+    mb_multi_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     cudaDeviceSynchronize();
+    bv_fs_cleanup(&bv);
+    if (bv_fs_init(&bv, n, n * MB_WRITES_PER_THREAD) != 0) return -1.0;
 
-    /* Timed write: n_warps warps, each loops over a slice of files */
+    /* Timed: create + seq write + fsync */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_seq_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
+    mb_multi_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
@@ -164,14 +166,16 @@ double beaver_run_rand(uint32_t nthreads)
     if (alloc_hashes(0xA1000000u, n, &d_hashes) != 0)
         { bv_fs_cleanup(&bv); return -1.0; }
 
-    uint32_t grid, blk;
-    mb_grid_block_warp(n, &grid, &blk);
-    mb_create_kernel_warp<<<grid, blk>>>(bv.vfs, d_hashes, n);
+    /* warm-up (not timed) */
+    mb_rand_multi_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     cudaDeviceSynchronize();
+    bv_fs_cleanup(&bv);
+    if (bv_fs_init(&bv, n, n * MB_WRITES_PER_THREAD) != 0) return -1.0;
 
+    /* Timed: create + rand write + fsync */
     mb_timer_t t;
     mb_timer_start(&t);
-    mb_rand_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
+    mb_rand_multi_write_kernel_loop<<<n_warps, 32u>>>(bv.vfs, d_hashes, g_wbuf, n);
     double ms = mb_cuda_sync_elapsed_ms(&t);
 
     cudaFree(d_hashes);
@@ -218,4 +222,40 @@ double beaver_run(mb_workload_t wl, uint32_t nthreads)
     case MB_MULTI: return beaver_run_multi(nthreads);
     default:       return -1.0;
     }
+}
+
+/* ── Raw data write: no metadata, no holders, no log ────────────── */
+/*
+ * Allocates a flat PM slab of MB_TOTAL_FILES × MB_DATA_PER_THREAD bytes
+ * and writes it using MB_BEAVER_WARPS warps with one __threadfence_system()
+ * per file.  No VFS, no inode, no COW holder, no log entry.
+ *
+ * Isolates pure PM data-write throughput from Beaver metadata overhead.
+ * The fence pattern (1 per file) is identical to Beaver's vfs_fsync.
+ */
+double beaver_run_raw_data(void)
+{
+    uint32_t n       = MB_TOTAL_FILES;
+    uint32_t n_warps = MB_BEAVER_WARPS;
+    size_t   total   = (size_t)n * MB_DATA_PER_THREAD;   /* 512 MiB */
+
+    gpm_region_t pm_region;
+    if (gpm_alloc(&pm_region, total, "beaver-rawdata") != GPM_SUCCESS) {
+        fprintf(stderr, "[Beaver/RawData] gpm_alloc(%zu) failed\n", total);
+        return -1.0;
+    }
+    void *pm_base = pm_region.addr;
+
+    /* warm-up */
+    mb_raw_write_kernel_loop<<<n_warps, 32u>>>(pm_base, g_wbuf, n);
+    cudaDeviceSynchronize();
+
+    /* timed run */
+    mb_timer_t t;
+    mb_timer_start(&t);
+    mb_raw_write_kernel_loop<<<n_warps, 32u>>>(pm_base, g_wbuf, n);
+    double ms = mb_cuda_sync_elapsed_ms(&t);
+
+    gpm_free(&pm_region);
+    return mb_throughput(ms);
 }

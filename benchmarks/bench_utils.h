@@ -77,25 +77,23 @@ static inline void mb_grid_block_warp(uint32_t n_files, uint32_t *grid, uint32_t
 
 static inline void mb_print_table_header(void)
 {
-    printf("  %-12s  %14s  %14s  %12s  %12s\n",
-           "CPU Workers", "pwrite+fsync", "pmem_persist", "cuFile", "Beaver(GPU)");
-    printf("  %-12s  %14s  %14s  %12s  %12s\n",
-           "------------", "--------------", "--------------",
-           "------------", "------------");
+    printf("  %-12s  %14s  %12s  %12s\n",
+           "CPU Workers", "pwrite+rename", "cuFile", "Beaver(GPU)");
+    printf("  %-12s  %14s  %12s  %12s\n",
+           "------------", "--------------", "------------", "------------");
 }
 
 static inline void mb_print_row(uint32_t nw,
-                                 double basic, double pmem,
+                                 double basic,
                                  double cufile, double beaver)
 {
-    char sb[16], sp[16], sc[16], sv[16];
+    char sb[16], sc[16], sv[16];
 #define FMT(buf, w, v) \
     do { if ((v) < 0.0) snprintf(buf,sizeof buf,"%*s",w,"N/A"); \
          else snprintf(buf,sizeof buf,"%*.1f",w,v); } while(0)
     FMT(sb, 14, basic);
-    FMT(sp, 14, pmem);
     FMT(sc, 12, cufile);
     FMT(sv, 12, beaver);
 #undef FMT
-    printf("  %-12u  %s  %s  %s  %s\n", nw, sb, sp, sc, sv);
+    printf("  %-12u  %s  %s  %s\n", nw, sb, sc, sv);
 }
