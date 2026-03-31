@@ -1,0 +1,22 @@
+=== E2 Prefetch Benchmark (C3 claim validation) ===
+Config: 15 files x 1000 pages each (58.6 MiB total), 5 iters
+
+ddio: found NVIDIA GPU at 0000:86:00.0 (AD102 [GeForce RTX 4090])
+ddio: DDIO disabled (GPU bus=0x86)
+Write (Beaver COW, GPU→PM):     37.4 MB/s  (1606.3 ms)
+PM cold read (GPU, volatile):   423.7 MB/s  (141.6 ms avg)  correct=YES
+Prefetch (CPU, PM→DRAM):        442.0 MB/s  (135.7 ms min)
+DRAM cold read (GPU, 1st pass): 4225.7 MB/s  (14.2 ms)  correct=YES
+DRAM warm read (GPU L2 hit):    4385.4 MB/s  (13.7 ms min)
+
+--- Summary ---
+Read speedup DRAM-cold vs PM:  9.97x
+Read speedup DRAM-warm vs PM:  10.35x  (L2 cached, compute path)
+
+--- E1 gap window comparison (block_47, GPT-2 XL, batch=6) ---
+  E1 PM write time (est.):     18.09 ms
+  Measured prefetch time:      135.74 ms  (CPU memcpy, min of 5)
+  Total required (wr+pf):      153.83 ms
+  E1 gap p50 (block_47):       275.1 ms
+  Margin:                      121.27 ms  → VIABLE
+ddio: DDIO enabled (GPU bus=0x86)

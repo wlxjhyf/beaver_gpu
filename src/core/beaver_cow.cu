@@ -141,12 +141,82 @@ beaver_error_t beaver_cache_cleanup(beaver_cache_t *cache)
     if (!cache || !cache->is_initialized)
         return BEAVER_ERROR_NOT_INITIALIZED;
 
+    beaver_dram_pool_cleanup(cache);
     gpm_free(&cache->pm_region);
     cudaFree(cache->hash_table);
     cudaFree(cache->holders);
     memset(cache, 0, sizeof(*cache));
 
     return BEAVER_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* DRAM prefetch layer                                                 */
+/* ------------------------------------------------------------------ */
+
+beaver_error_t beaver_dram_pool_init(beaver_cache_t *cache, uint32_t pool_pages)
+{
+    if (!cache || !cache->is_initialized || pool_pages == 0)
+        return BEAVER_ERROR_NOT_INITIALIZED;
+
+    if (cache->dram_pool_host)   /* already initialised */
+        return BEAVER_SUCCESS;
+
+    cudaError_t cu;
+
+    /* Per-holder device pointer table: managed so GPU can read, CPU can write */
+    cu = cudaMallocManaged((void **)&cache->dram_dev_ptrs,
+                           cache->max_holders * sizeof(void *));
+    if (cu != cudaSuccess) {
+        fprintf(stderr, "beaver_dram_pool_init: cudaMallocManaged(dram_dev_ptrs): %s\n",
+                cudaGetErrorString(cu));
+        return BEAVER_ERROR_OUT_OF_MEMORY;
+    }
+    cudaMemset(cache->dram_dev_ptrs, 0, cache->max_holders * sizeof(void *));
+
+    /* Pinned+mapped DRAM page pool: accessible from both CPU and GPU */
+    cu = cudaHostAlloc((void **)&cache->dram_pool_host,
+                       (size_t)pool_pages * BEAVER_PAGE_SIZE,
+                       cudaHostAllocMapped);
+    if (cu != cudaSuccess) {
+        fprintf(stderr, "beaver_dram_pool_init: cudaHostAlloc(%zu MiB): %s\n",
+                (size_t)pool_pages * BEAVER_PAGE_SIZE >> 20, cudaGetErrorString(cu));
+        cudaFree(cache->dram_dev_ptrs);
+        cache->dram_dev_ptrs = NULL;
+        return BEAVER_ERROR_OUT_OF_MEMORY;
+    }
+
+    cache->dram_pool_capacity = pool_pages;
+    cache->dram_pool_cursor   = 0;
+
+    if (getenv("VERBOSE"))
+        printf("beaver_dram_pool_init: %u pages (%.1f MiB pinned DRAM)\n",
+               pool_pages, (double)pool_pages * BEAVER_PAGE_SIZE / (1 << 20));
+
+    return BEAVER_SUCCESS;
+}
+
+void beaver_dram_pool_reset(beaver_cache_t *cache)
+{
+    if (!cache || !cache->dram_pool_host) return;
+    /* Clear all DRAM pointers so GPU falls back to PM until next prefetch */
+    cudaMemset(cache->dram_dev_ptrs, 0, cache->max_holders * sizeof(void *));
+    cache->dram_pool_cursor = 0;
+}
+
+void beaver_dram_pool_cleanup(beaver_cache_t *cache)
+{
+    if (!cache) return;
+    if (cache->dram_pool_host) {
+        cudaFreeHost(cache->dram_pool_host);
+        cache->dram_pool_host = NULL;
+    }
+    if (cache->dram_dev_ptrs) {
+        cudaFree(cache->dram_dev_ptrs);
+        cache->dram_dev_ptrs = NULL;
+    }
+    cache->dram_pool_capacity = 0;
+    cache->dram_pool_cursor   = 0;
 }
 
 /* ------------------------------------------------------------------ */

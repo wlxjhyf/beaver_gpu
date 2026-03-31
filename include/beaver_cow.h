@@ -177,6 +177,23 @@ typedef struct {
     /* PM slab */
     gpm_region_t         pm_region;
     void                *pm_base;    /* UVA pointer to PM slab             */
+    /*
+     * DRAM prefetch layer (optional — init via beaver_dram_pool_init).
+     *
+     * dram_dev_ptrs[holder_idx]: GPU-accessible pointer to the pinned DRAM
+     *   page for this holder.  NULL = not prefetched.  Written by the CPU
+     *   prefetch path and read by GPU kernels in beaver_data_read.
+     *   Invalidated (set to NULL) by the GPU write path on every COW flip
+     *   so stale DRAM copies are never served after a new write.
+     *
+     * dram_pool_host: cudaHostAlloc(cudaHostAllocMapped) pinned DRAM slab.
+     *   Mapped into GPU address space; GPU threads can read via dram_dev_ptrs.
+     *   Allocated as a bump pool; reset dram_pool_cursor to reuse across iters.
+     */
+    void               **dram_dev_ptrs;    /* cudaMallocManaged [max_holders]   */
+    char                *dram_pool_host;   /* cudaHostAlloc, pinned+mapped      */
+    uint32_t             dram_pool_capacity; /* pages in dram_pool_host         */
+    uint32_t             dram_pool_cursor;   /* host-side atomic bump           */
 } beaver_cache_t;
 
 /* Error codes */
@@ -204,6 +221,34 @@ beaver_error_t beaver_cache_init(beaver_cache_t *cache, uint32_t max_holders);
  * beaver_cache_cleanup: release PM region and device memory.
  */
 beaver_error_t beaver_cache_cleanup(beaver_cache_t *cache);
+
+/*
+ * beaver_dram_pool_init: allocate the DRAM prefetch layer for a cache.
+ *
+ * pool_pages: number of 4 KiB pages in the pinned DRAM pool.
+ *   Size it to cover the maximum number of pages that will be prefetched
+ *   simultaneously (e.g. max pages per file × concurrent files).
+ *
+ * Must be called after beaver_cache_init.  Safe to call once per cache;
+ * calling again without cleanup is a no-op (returns BEAVER_SUCCESS).
+ */
+beaver_error_t beaver_dram_pool_init(beaver_cache_t *cache, uint32_t pool_pages);
+
+/*
+ * beaver_dram_pool_reset: reclaim all DRAM pool pages for reuse.
+ *
+ * Resets dram_pool_cursor to 0 and clears dram_dev_ptrs[].
+ * Call between training iterations to avoid pool exhaustion.
+ * Must be called from the host after all GPU kernels that may read
+ * dram_dev_ptrs have completed (cudaDeviceSynchronize or stream sync).
+ */
+void beaver_dram_pool_reset(beaver_cache_t *cache);
+
+/*
+ * beaver_dram_pool_cleanup: release the DRAM prefetch layer resources.
+ * Safe to call even if beaver_dram_pool_init was never called.
+ */
+void beaver_dram_pool_cleanup(beaver_cache_t *cache);
 
 /* ------------------------------------------------------------------ */
 /* Device-side COW primitives — static __device__ inline              */

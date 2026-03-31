@@ -42,6 +42,17 @@ if(DEFINED MB_BEAVER_WARPS)
     message(STATUS "microbench: MB_BEAVER_WARPS=${MB_BEAVER_WARPS}")
 endif()
 
+# ── e2_prefetch_bench (E2: DRAM prefetch validation & perf) ──────────
+add_executable(e2_prefetch_bench
+    e2_prefetch_bench.cu
+    ${CMAKE_SOURCE_DIR}/tests/ddio_helper.cpp)
+
+target_link_libraries(e2_prefetch_bench beaver_gpu_lib)
+
+set_target_properties(e2_prefetch_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 # ── rawgpm_bench (Phase A: raw GPU→PM bandwidth ceiling) ─────────────
 add_executable(rawgpm_bench
     rawgpm_bench.cu

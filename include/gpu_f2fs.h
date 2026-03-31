@@ -251,6 +251,18 @@ void gpu_f2fs_do_checkpoint(gpu_f2fs_t *fs);
  */
 void gpu_vfs_mount_f2fs(gpu_vfs_t *vfs, gpu_f2fs_t *f2fs);
 
+/*
+ * gpu_f2fs_prefetch: host-side prefetch of all written pages for fd from PM
+ * to pinned CPU DRAM.  After this call, gpu_f2fs_read() will serve pages from
+ * the DRAM cache instead of reading PM directly, reducing read latency.
+ *
+ * Requires beaver_dram_pool_init() on fs->data_cache before first use.
+ * Call after the GPU write kernel completes and before the GPU read kernel
+ * starts (i.e., during the gap period).
+ * Reset the DRAM pool between iterations: beaver_dram_pool_reset(data_cache).
+ */
+void gpu_f2fs_prefetch(gpu_f2fs_t *fs, int fd);
+
 /* ------------------------------------------------------------------ */
 /* VFS dispatch — __forceinline__ direct calls, no runtime ptrs      */
 /* ------------------------------------------------------------------ */
@@ -305,6 +317,16 @@ static __device__ __forceinline__ int
 vfs_write_data_warp(gpu_vfs_t *vfs, int fd, uint32_t pgoff, const void *src)
 {
     return gpu_f2fs_write_data_warp((gpu_f2fs_t *)vfs->fs, fd, pgoff, src);
+}
+
+/*
+ * vfs_prefetch: host-side prefetch of fd's pages from PM to pinned DRAM.
+ * Call during the gap period (after write kernel, before read kernel).
+ */
+static inline void
+vfs_prefetch(gpu_vfs_t *vfs, int fd)
+{
+    gpu_f2fs_prefetch((gpu_f2fs_t *)vfs->fs, fd);
 }
 
 #endif /* GPU_F2FS_H */

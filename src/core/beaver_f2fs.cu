@@ -8,20 +8,34 @@
  * Contents:
  *   beaver_inode_persist      (__device__) — COW-persist one F2FS inode to PM
  *   beaver_data_write         (__device__) — COW-persist one data page to PM
- *   beaver_data_read          (__device__) — lock-free read of a data page from PM
+ *   beaver_data_read          (__device__) — read from DRAM cache if available, else PM
  *   beaver_f2fs_init_holders  (host)       — pre-allocate one inode holder per nid
+ *   gpu_f2fs_prefetch         (host)       — prefetch file pages from PM to pinned DRAM
  *
  * Write path (both inode and data):
  *   gpm_memcpy_nodrain → pm slot          (volatile stores, no drain yet)
  *   beaver_log_write   → PM log entry     (volatile stores, no drain yet)
  *   beaver_holder_flip                    (cur update + __threadfence_system() drain
  *                                          + read_ptr publish)
+ *   DRAM invalidation: dram_dev_ptrs[idx] = NULL (managed, GPU-side)
  *   Total: exactly 1 drain per write.
+ *
+ * Read path:
+ *   1. dram_dev_ptrs[holder_idx] != NULL → GPU thread load from pinned DRAM (PCIe)
+ *   2. fallback → GPU thread load from PM (existing volatile-load path)
+ *
+ * DRAM coherency: dram_dev_ptrs is cudaMallocManaged. CPU writes it during
+ *   prefetch (gap period, no GPU kernel running); GPU reads it during compute.
+ *   Separated by CUDA stream synchronization at the application level.
+ *   GPU write path invalidates the entry atomically so stale DRAM data is
+ *   never served after a new COW flip.
  */
 
 #include "gpu_f2fs.h"
 #include "beaver_cow.h"
 #include <cuda_runtime.h>
+#include <string.h>  /* memcpy for host prefetch */
+#include <stdio.h>
 
 /* ================================================================== */
 /* Device: inode COW persist                                           */
@@ -102,6 +116,10 @@ __device__ uint32_t beaver_data_write(
 
     beaver_spin_lock(&h->gpu_lock);
 
+    /* Invalidate DRAM cache before COW flip: stale copy must not be served */
+    if (fs->data_cache->dram_dev_ptrs)
+        fs->data_cache->dram_dev_ptrs[idx] = NULL;
+
     void *waddr = beaver_holder_write_addr(h);
     gpm_memcpy_nodrain(waddr, src, BEAVER_PAGE_SIZE);
 
@@ -159,6 +177,11 @@ __device__ uint32_t beaver_data_write_stage(
     }
 
     beaver_spin_lock(&h->gpu_lock);
+
+    /* Invalidate DRAM cache before staging the new write */
+    if (fs->data_cache->dram_dev_ptrs)
+        fs->data_cache->dram_dev_ptrs[idx] = NULL;
+
     beaver_holder_stage(h, src);          /* write + cur update, no fence */
     int next = h->cur;
     beaver_log_write(&fs->log, BLOG_DATA_FLIP, nid, pgoff, (uint32_t)next);
@@ -194,12 +217,16 @@ __device__ void beaver_inode_persist_stage(gpu_f2fs_t *fs, uint32_t nid)
 /* ================================================================== */
 
 /*
- * beaver_data_read: lock-free read of one 4 KiB data page.
+ * beaver_data_read: read one 4 KiB data page, preferring the DRAM cache.
  *
  * holder_idx: the value stored in inode.i_addr[pgoff] by a prior write.
  * Returns 0 on success, -1 if the page has not been written.
  *
- * Uses volatile loads to bypass GPU L2 cache (DDIO disabled).
+ * Read priority:
+ *   1. DRAM cache hit (dram_dev_ptrs[holder_idx] != NULL):
+ *      GPU thread loads from pinned CPU DRAM via PCIe.
+ *      Faster than PM reads: lower DRAM latency even over PCIe.
+ *   2. PM fallback: volatile loads from PM (DDIO disabled), existing path.
  */
 __device__ int beaver_data_read(
         gpu_f2fs_t *fs, uint32_t holder_idx, void *dst)
@@ -207,6 +234,20 @@ __device__ int beaver_data_read(
     if (holder_idx >= fs->data_cache->max_holders)
         return -1;
 
+    /* DRAM cache hit: GPU thread reads pinned DRAM via device pointer */
+    void **dram_dev_ptrs = fs->data_cache->dram_dev_ptrs;
+    if (dram_dev_ptrs) {
+        void *dram_addr = dram_dev_ptrs[holder_idx];
+        if (dram_addr) {
+            unsigned long long *s = (unsigned long long *)dram_addr;
+            unsigned long long *d = (unsigned long long *)dst;
+            for (uint32_t i = 0; i < BEAVER_PAGE_SIZE / 8; ++i)
+                d[i] = s[i];
+            return 0;
+        }
+    }
+
+    /* PM fallback: volatile loads bypass GPU L2 (DDIO disabled) */
     beaver_holder_t *h = &fs->data_cache->holders[holder_idx];
     void *addr = beaver_holder_get_read(h);
     if (!addr)
@@ -246,4 +287,93 @@ void beaver_f2fs_init_holders(beaver_cache_t *cow_cache, uint32_t max_inodes)
     uint32_t threads = 256;
     uint32_t blocks  = (max_inodes + threads - 1) / threads;
     beaver_f2fs_init_holders_kernel<<<blocks, threads>>>(cow_cache, max_inodes);
+}
+
+/* ================================================================== */
+/* Host: DRAM prefetch                                                 */
+/* ================================================================== */
+
+/*
+ * gpu_f2fs_prefetch: prefetch all written pages of fd from PM to pinned DRAM.
+ *
+ * Batch design: instead of one cudaMemcpy per holder (API call overhead
+ * dominates at ~8 µs/call × N pages), we:
+ *   1. Read the inode once to collect all valid holder indices.
+ *   2. One cudaMemcpy of holders[min_hidx .. max_hidx] → host buffer.
+ *   3. CPU-only loop: extract read_ptr + memcpy PM → pinned DRAM.
+ *
+ * Coherency: call after the GPU write kernel has completed and before the
+ * GPU read kernel starts (CUDA stream sync at application level).
+ * Reset the DRAM pool between iterations: beaver_dram_pool_reset().
+ * IMPORTANT: requires beaver_dram_pool_init() to have been called first.
+ */
+void gpu_f2fs_prefetch(gpu_f2fs_t *fs, int fd)
+{
+    if (!fs || fd < 0 || (uint32_t)fd >= fs->max_inodes) return;
+    uint32_t nid = (uint32_t)fd;
+
+    beaver_cache_t *dc = fs->data_cache;
+    if (!dc || !dc->dram_dev_ptrs || !dc->dram_pool_host) return;
+
+    /* Step 1: one cudaMemcpy for the inode */
+    f2fs_inode_t inode;
+    cudaMemcpy(&inode, &fs->inode_shadow[nid].inode,
+               sizeof(f2fs_inode_t), cudaMemcpyDeviceToHost);
+
+    /* Scan i_addr[] to find the range of holder indices we need */
+    uint32_t min_hidx = UINT32_MAX, max_hidx = 0;
+    for (uint32_t pgoff = 0; pgoff < F2FS_ADDRS_PER_INODE; ++pgoff) {
+        uint32_t hidx = inode.i_addr[pgoff];
+        if (hidx == (uint32_t)F2FS_NULL_ADDR || hidx >= dc->max_holders) continue;
+        if (dc->dram_dev_ptrs[hidx] != NULL) continue; /* already cached */
+        if (hidx < min_hidx) min_hidx = hidx;
+        if (hidx > max_hidx) max_hidx = hidx;
+    }
+
+    if (min_hidx > max_hidx) return; /* nothing to prefetch */
+
+    /* Step 2: one cudaMemcpy for all needed holders [min_hidx .. max_hidx] */
+    uint32_t range = max_hidx - min_hidx + 1;
+    beaver_holder_t *holders_host =
+        (beaver_holder_t *)malloc(range * sizeof(beaver_holder_t));
+    if (!holders_host) {
+        fprintf(stderr, "gpu_f2fs_prefetch: malloc failed\n");
+        return;
+    }
+    cudaMemcpy(holders_host, &dc->holders[min_hidx],
+               range * sizeof(beaver_holder_t), cudaMemcpyDeviceToHost);
+
+    /* Step 3: CPU-only loop — no more cudaMemcpy per page */
+    for (uint32_t pgoff = 0; pgoff < F2FS_ADDRS_PER_INODE; ++pgoff) {
+        uint32_t hidx = inode.i_addr[pgoff];
+        if (hidx == (uint32_t)F2FS_NULL_ADDR || hidx >= dc->max_holders) continue;
+        if (dc->dram_dev_ptrs[hidx] != NULL) continue; /* already cached */
+
+        void *pm_addr = holders_host[hidx - min_hidx].read_ptr;
+        if (!pm_addr) continue; /* page not yet committed */
+
+        uint32_t slot = __sync_fetch_and_add(&dc->dram_pool_cursor, 1u);
+        if (slot >= dc->dram_pool_capacity) {
+            fprintf(stderr, "gpu_f2fs_prefetch: DRAM pool exhausted "
+                    "(fd=%d pgoff=%u); call beaver_dram_pool_reset()\n", fd, pgoff);
+            break;
+        }
+        char *dram_page = dc->dram_pool_host + (size_t)slot * BEAVER_PAGE_SIZE;
+
+        /* PM → pinned DRAM (pm_addr is UVA, host-accessible) */
+        memcpy(dram_page, pm_addr, BEAVER_PAGE_SIZE);
+
+        /* Publish GPU-accessible pointer */
+        void *dev_ptr = NULL;
+        cudaError_t cu = cudaHostGetDevicePointer(&dev_ptr, dram_page, 0);
+        if (cu != cudaSuccess || !dev_ptr) {
+            fprintf(stderr, "gpu_f2fs_prefetch: cudaHostGetDevicePointer failed: %s\n",
+                    cudaGetErrorString(cu));
+            __sync_fetch_and_add(&dc->dram_pool_cursor, (uint32_t)-1);
+            continue;
+        }
+        dc->dram_dev_ptrs[hidx] = dev_ptr;
+    }
+
+    free(holders_host);
 }
