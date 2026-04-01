@@ -98,7 +98,9 @@ beaver_error_t beaver_cache_init(beaver_cache_t *cache, uint32_t max_holders)
         return BEAVER_ERROR_PM_ERROR;
     }
 
-    cache->pm_base = cache->pm_region.addr;
+    /* Use dev_addr (GPU-accessible pointer) as pm_base so that
+     * pm_addrs stored in holders are directly dereferenceable in device code. */
+    cache->pm_base = cache->pm_region.dev_addr;
 
     /* Initialise holders and hash table entirely on the GPU */
     uint32_t cover   = cache->hash_size > max_holders
@@ -245,7 +247,7 @@ int beaver_log_init(beaver_log_t *log, uint32_t capacity)
         return -1;
     }
 
-    log->entries  = (beaver_log_entry_t *)log->pm_region.addr;
+    log->entries  = (beaver_log_entry_t *)log->pm_region.dev_addr;
     log->capacity = capacity;
     log->head     = 0;
     log->log_seq  = 0;

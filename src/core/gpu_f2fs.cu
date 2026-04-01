@@ -460,7 +460,7 @@ gpu_f2fs_err_t gpu_f2fs_init(gpu_f2fs_t     *fs,
                     inode_pm_sz >> 20);
             goto err_pminode;
         }
-        fs->pm_inode_base = fs->pm_inode_region.addr;
+        fs->pm_inode_base = fs->pm_inode_region.dev_addr;
     }
 
     /* PM write-ahead log */

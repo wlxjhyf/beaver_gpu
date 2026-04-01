@@ -17,3 +17,9 @@ target_link_libraries(f2fs_kernel_test beaver_gpu_lib)
 set_target_properties(f2fs_kernel_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_executable(gpm_large_register_test gpm_large_register_test.cu)
+target_link_libraries(gpm_large_register_test beaver_gpu_lib)
+set_target_properties(gpm_large_register_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)

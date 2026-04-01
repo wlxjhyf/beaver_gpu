@@ -40,19 +40,22 @@
  * gpm_region_t: descriptor for a persistent memory region.
  *
  * After gpm_alloc():
- *   addr      - sub-pointer inside the global devdax mmap, registered with
- *               cudaHostRegister(flag=0). Under CUDA UVA the same host virtual
- *               address is directly accessible from device code.
- *               Do NOT call cudaHostGetDevicePointer; just use addr on both sides.
+ *   addr      - sub-pointer inside the global devdax mmap (host virtual address,
+ *               for CPU-side memcpy/prefetch and gpm_free/unregister).
+ *   dev_addr  - GPU-accessible device pointer, obtained via
+ *               cudaHostGetDevicePointer after cudaHostRegister.
+ *               On UVA systems dev_addr == addr, but always use dev_addr for
+ *               any pointer that will be dereferenced by GPU kernels.
  *   pm_offset - byte offset from the start of the devdax device (for T2-style
  *               persistence verification via a fresh independent mmap).
  */
 typedef struct {
-    void*  addr;      /* PM virtual address, usable from host and GPU */
-    size_t size;      /* Byte size of this region (2 MB-aligned)      */
-    size_t pm_offset; /* Offset from devdax base (for remap/verify)   */
-    int    is_pmem;   /* 1 = real PM device, 0 = DAX-emulated         */
-    int    is_valid;  /* 1 = region is live                           */
+    void*  addr;      /* PM host virtual address (CPU memcpy, gpm_free)    */
+    void*  dev_addr;  /* GPU-accessible pointer (use in device code)       */
+    size_t size;      /* Byte size of this region (2 MB-aligned)           */
+    size_t pm_offset; /* Offset from devdax base (for remap/verify)        */
+    int    is_pmem;   /* 1 = real PM device, 0 = DAX-emulated              */
+    int    is_valid;  /* 1 = region is live                                */
 } gpm_region_t;
 
 /* Error codes */

@@ -123,16 +123,35 @@ gpm_error_t gpm_alloc(gpm_region_t* region, size_t size, const char* tag)
     void* sub = (char*)gpm_devdax_base + gpm_devdax_offset;
 
     /* Register sub-region with CUDA.
-     * Flag 0 (cudaHostRegisterDefault): devdax VM_PFNMAP pages pass
-     * pin_user_pages(FOLL_LONGTERM) on Linux 6.1, unlike fsdax _PAGE_DEVMAP. */
-    cudaError_t cuda_err = cudaHostRegister(sub, alloc_size, 0);
+     * cudaHostRegisterMapped explicitly requests GPU address-space mapping;
+     * required for device kernels to dereference PM addresses at any scale.
+     * devdax VM_PFNMAP pages pass pin_user_pages(FOLL_LONGTERM) on Linux 6.1+. */
+    cudaError_t cuda_err = cudaHostRegister(sub, alloc_size,
+                                            cudaHostRegisterMapped);
     if (cuda_err != cudaSuccess) {
-        fprintf(stderr, "gpm_alloc: cudaHostRegister(%p, %zu, 0) failed: %s\n",
+        fprintf(stderr, "gpm_alloc: cudaHostRegister(%p, %zu, Mapped) failed: %s\n",
                 sub, alloc_size, cudaGetErrorString(cuda_err));
         return GPM_ERROR_ALLOC_FAILED;
     }
 
+    /* Obtain the GPU-accessible device pointer.
+     * On UVA systems this equals sub, but calling cudaHostGetDevicePointer
+     * makes the mapping explicit and is the only correct way to get a device
+     * pointer for memory registered with cudaHostRegister. */
+    void *dev_ptr = NULL;
+    cuda_err = cudaHostGetDevicePointer(&dev_ptr, sub, 0);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "gpm_alloc: cudaHostGetDevicePointer(%p) failed: %s\n",
+                sub, cudaGetErrorString(cuda_err));
+        cudaHostUnregister(sub);
+        return GPM_ERROR_ALLOC_FAILED;
+    }
+    if (dev_ptr != sub)
+        fprintf(stderr, "gpm_alloc: NOTE host VA %p != dev VA %p "
+                "(using dev VA for GPU access)\n", sub, dev_ptr);
+
     region->addr      = sub;
+    region->dev_addr  = dev_ptr;
     region->size      = alloc_size;
     region->pm_offset = gpm_devdax_offset;
     region->is_pmem   = gpm_devdax_is_pmem;
