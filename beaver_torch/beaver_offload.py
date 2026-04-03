@@ -1,22 +1,21 @@
 """
-beaver_offload.py — BeaverOffloadManager: PM-backed per-layer offload.
+beaver_offload.py — BeaverManager and BaselineManager for E2e Experiments.
 
-Drop-in replacement for OffloadManager in e2e_train_offload.py.
-Uses Beaver GPU F2FS + Beaver COW for crash-consistent PM storage.
+Per e2e_experiment_plan.md:
+  - BeaverManager: GPU → PM (COW) + async prefetch PM → DRAM
+  - BaselineManager: GPU → DRAM → PM (sync+rename, crash-consistent)
 
-Write path:  GPU tensor → Beaver COW → PM  (via beaver_ext.write)
-Gap:         PM → pinned DRAM              (via beaver_ext.prefetch)
-Read path:   pinned DRAM → GPU tensor     (via beaver_ext.read, DRAM hit)
+Both managers implement the same interface:
+  - evict_readonly(block_idx, params): release GPU memory, no PM write
+  - evict_dirty(block_idx, params): write to PM + trigger prefetch
+  - restore(block_idx, params): DRAM (hit) or PM (miss) → GPU
+  - prefetch(block_idx): PM → DRAM (async, during gap period)
+  - reset_dram_pool(): reclaim DRAM pool for next iteration
 
-File chunking:
-  F2FS_ADDRS_PER_INODE = 1017 → max 1017 pages (~4.16 MiB) per file.
-  Large tensors are split into multiple chunk files automatically.
-  Each chunk is written/read independently.
-
-Usage in e2e_train_offload.py:
-  from beaver_offload import BeaverOffloadManager
-  offload = BeaverOffloadManager(blocks)
-  # Same interface as OffloadManager: write/prefetch/read/adam_step/...
+Training loop integration (per e2e_experiment_plan.md):
+  Forward:  restore → compute → evict_readonly (params not modified)
+  Backward: restore → compute → evict_readonly (params not modified)
+  Optimizer step: restore → Adam update → evict_dirty (params modified)
 """
 
 import os
@@ -25,7 +24,7 @@ import time
 import numpy as np
 import torch
 
-# Adam hyperparams (must match e2e_train_offload.py)
+# Adam hyperparams (must match training script)
 LR           = 3e-4
 WEIGHT_DECAY = 0.01
 BETA1, BETA2 = 0.9, 0.999
@@ -49,16 +48,20 @@ def _import_beaver_ext():
         ) from e
 
 
-class BeaverOffloadManager:
+class BeaverManager:
     """
     Per-layer parameter offload to Intel Optane PM via Beaver COW.
 
-    Interface is identical to OffloadManager (DRAM version) in
-    e2e_train_offload.py so the training script can switch backends
-    by changing one line.
+    Write path (evict_dirty):
+      GPU tensor → Beaver COW → PM (crash-consistent)
+      + trigger async prefetch: PM → pinned DRAM
 
-    Init computes FS sizing from actual tensor shapes and pre-creates
-    all chunk files on the PM-backed GPU F2FS.
+    Read path (restore):
+      DRAM (prefetch hit) → GPU (fast)
+      PM (miss) → GPU (slow fallback)
+
+    evict_readonly:
+      Only release GPU memory, no PM write (forward/backward evict)
     """
 
     def __init__(self, blocks, lr=LR, weight_decay=WEIGHT_DECAY,
@@ -104,7 +107,7 @@ class BeaverOffloadManager:
         # DRAM pool must hold all pages simultaneously (prefetch all before read)
         dram_pool_pages = total_data_pages + 256
 
-        print(f"BeaverOffloadManager sizing:")
+        print(f"BeaverManager sizing:")
         print(f"  blocks            : {self.num_blocks}")
         print(f"  total chunk files : {total_files}  (max_inodes={max_inodes})")
         print(f"  total data pages  : {total_data_pages} "
@@ -147,21 +150,18 @@ class BeaverOffloadManager:
             self.grads.append([torch.zeros_like(x) for x in p32s])
         print("  Done.")
 
-    # ── Chunked write helper ─────────────────────────────────────────────
+    # ── Chunked write/read helpers ───────────────────────────────────────
 
     def _write_param(self, bi, pi, tensor):
         """Write one tensor to its chunk files on PM."""
         raw     = tensor.contiguous()
         n_bytes = raw.nbytes
-        base    = raw.data_ptr()          # CUDA device pointer to start of storage
+        base    = raw.data_ptr()
         n_chunks = len(self.fds[bi][pi])
         for ci in range(n_chunks):
             byte_off    = ci * CHUNK_BYTES
             byte_end    = min(byte_off + CHUNK_BYTES, n_bytes)
             chunk_bytes = byte_end - byte_off
-            # Compute pointer by offsetting base address directly.
-            # raw.view(uint8)[byte_off:].data_ptr() returns 0 for non-zero offsets
-            # on CUDA tensors (PyTorch view+slice behavior); use base+offset instead.
             chunk_ptr   = base + byte_off
             self._ext.write(self.fds[bi][pi][ci], chunk_ptr, chunk_bytes)
 
@@ -178,23 +178,38 @@ class BeaverOffloadManager:
             chunk_ptr   = base + byte_off
             self._ext.read(self.fds[bi][pi][ci], chunk_ptr, chunk_bytes)
 
-    # ── Storage interface (PM-swap point) ───────────────────────────────
+    # ── Core interface (per e2e_experiment_plan.md) ──────────────────────
 
-    def write(self, block_idx, params):
-        """Evict: GPU → PM via Beaver COW (crash-consistent)."""
+    def evict_readonly(self, block_idx, params):  # noqa: ARG002
+        """
+        Forward/Backward evict: params not modified, only release GPU memory.
+        PM already has the correct version, no write needed.
+
+        Args:
+            block_idx: Block index (unused, kept for interface consistency)
+            params: List of parameters (unused, kept for interface consistency)
+
+        Note: In PyTorch, we can't truly "release" GPU memory without deleting
+        the tensor. The caller should del params[i] after this call.
+        This function is a no-op for Beaver (PM already has correct data).
+        """
+        _ = block_idx, params  # Silence unused parameter warnings
+
+    def evict_dirty(self, block_idx, params):
+        """
+        Optimizer step evict: params modified, must COW write to PM.
+        Also triggers async prefetch for next iteration.
+        """
         t0 = time.perf_counter()
         for pi, p in enumerate(params):
             self._write_param(block_idx, pi, p.data)
         torch.cuda.synchronize()
         self._write_ms.append((time.perf_counter() - t0) * 1e3)
 
-    def prefetch(self, block_idx):
-        """Gap-period prefetch: PM → pinned CPU DRAM (cpu memcpy)."""
-        for pi in range(len(self.fds[block_idx])):
-            for fd in self.fds[block_idx][pi]:
-                self._ext.prefetch(fd)
+        # Trigger async prefetch (PM → DRAM) for next iteration
+        self.prefetch(block_idx)
 
-    def read(self, block_idx, params):
+    def restore(self, block_idx, params):
         """Restore: DRAM hit → GPU (fast path after prefetch)."""
         t0 = time.perf_counter()
         for pi, p in enumerate(params):
@@ -202,9 +217,25 @@ class BeaverOffloadManager:
         torch.cuda.synchronize()
         self._read_ms.append((time.perf_counter() - t0) * 1e3)
 
+    def prefetch(self, block_idx):
+        """Gap-period prefetch: PM → pinned CPU DRAM (cpu memcpy)."""
+        for pi in range(len(self.fds[block_idx])):
+            for fd in self.fds[block_idx][pi]:
+                self._ext.prefetch(fd)
+
     def reset_dram_pool(self):
         """Reclaim DRAM pool pages. Call at start of each iteration's prefetch."""
         self._ext.reset_dram_pool()
+
+    # ── Legacy interface (for backward compatibility) ────────────────────
+
+    def write(self, block_idx, params):
+        """Alias for evict_dirty (legacy interface)."""
+        self.evict_dirty(block_idx, params)
+
+    def read(self, block_idx, params):
+        """Alias for restore (legacy interface)."""
+        self.restore(block_idx, params)
 
     # ── Gradient collection + Adam ───────────────────────────────────────
 
@@ -237,21 +268,10 @@ class BeaverOffloadManager:
     def sync_weights_to_gpu(self, blocks):
         """
         After adam_step, push updated fp32 master weights back to GPU fp16 params.
-        Call this after adam_step() and before the next forward pass.
-        Unlike the DRAM path (which syncs via pinned buffers), here the updated
-        weights must be written to PM and then read back to GPU.
-
-        Practical use:
-          offload.adam_step()
-          offload.sync_weights_to_gpu(blocks)   # update GPU params from fp32
-          offload.reset_dram_pool()
-          for i in range(num_blks):
-              offload.prefetch(i)
         """
         for bi, blk in enumerate(blocks):
             for pi, p in enumerate(blk.parameters()):
                 p32 = self.p_fp32[bi][pi]
-                # Update GPU fp16 param from CPU fp32 master
                 p.data.copy_(p32.half().to(p.device))
 
     def zero_grads(self):
@@ -272,3 +292,264 @@ class BeaverOffloadManager:
     def read_ms_stats(self):
         a = self._read_ms
         return (float(np.median(a)), float(np.percentile(a, 95))) if a else (0.0, 0.0)
+
+
+class BaselineManager:
+    """
+    Baseline: DeepSpeed ZeRO-3 style DRAM two-hop + per-checkpoint rename.
+
+    Simulates the standard approach: parameters are written through DRAM to
+    PM (ext4-dax on /mnt/pmem), with crash consistency guaranteed by
+    per-checkpoint directory rename (all blocks written → fsync → rename).
+
+    Write path (evict_dirty):
+      GPU → cudaMemcpy D2H → pinned DRAM buffer
+      + pwrite to tmp directory (no fsync/rename yet)
+
+    Checkpoint commit (checkpoint_commit, called once after all evict_dirty):
+      fsync each file in tmp dir → fsync tmp dir
+      → rename tmp dir → latest dir → fsync parent
+
+    Read path (restore):
+      pinned DRAM buffer → GPU (normal operation, DRAM always has latest)
+    """
+
+    def __init__(self, blocks, pm_dir="/mnt/pmem/baseline",
+                 lr=LR, weight_decay=WEIGHT_DECAY,
+                 beta1=BETA1, beta2=BETA2, eps=EPS):
+        self.num_blocks  = len(blocks)
+        self.lr          = lr
+        self.wd          = weight_decay
+        self.beta1       = beta1
+        self.beta2       = beta2
+        self.eps         = eps
+        self.step_count  = 0
+        self.pm_dir      = pm_dir
+        self._ckpt_gen   = 0       # alternating checkpoint generation (0/1)
+
+        self._write_ms      = []   # per evict_dirty call (GPU→DRAM + pwrite)
+        self._read_ms       = []   # per restore call (DRAM→GPU)
+        self._checkpoint_ms = []   # per checkpoint_commit call
+
+        # Create PM directory structure
+        os.makedirs(pm_dir, exist_ok=True)
+
+        # ── Compute sizing ──────────────────────────────────────────────
+        self.shapes = []
+        total_bytes = 0
+
+        for blk in blocks:
+            blk_shapes = []
+            for p in blk.parameters():
+                blk_shapes.append((p.data.shape, p.data.dtype))
+                total_bytes += p.data.nbytes
+            self.shapes.append(blk_shapes)
+
+        print(f"BaselineManager sizing:")
+        print(f"  blocks      : {self.num_blocks}")
+        print(f"  total bytes : {total_bytes / 1024**3:.2f} GB")
+        print(f"  PM dir      : {pm_dir}")
+
+        # ── DRAM buffers (pinned for fast H2D/D2H) ──────────────────────
+        self.dram_buffers = []  # dram_buffers[bi][pi] = pinned CPU tensor
+        print("  Allocating pinned DRAM buffers ...")
+        for blk in blocks:
+            blk_bufs = []
+            for p in blk.parameters():
+                buf = torch.empty_like(p.data, device='cpu', pin_memory=True)
+                blk_bufs.append(buf)
+            self.dram_buffers.append(blk_bufs)
+        print("  Done.")
+
+        # ── CPU Adam states ─────────────────────────────────────────────
+        self.m      = []
+        self.v      = []
+        self.p_fp32 = []
+        self.grads  = []
+
+        print("  Allocating CPU Adam states ...")
+        for blk in blocks:
+            ps = list(blk.parameters())
+            p32s = [p.data.float().cpu() for p in ps]
+            self.p_fp32.append(p32s)
+            self.m.append([torch.zeros_like(x) for x in p32s])
+            self.v.append([torch.zeros_like(x) for x in p32s])
+            self.grads.append([torch.zeros_like(x) for x in p32s])
+        print("  Done.")
+
+    # ── Path helpers ─────────────────────────────────────────────────────
+
+    def _tmp_dir(self):
+        """Staging directory for current checkpoint writes."""
+        return os.path.join(self.pm_dir, "ckpt_tmp")
+
+    def _latest_dir(self):
+        """Committed checkpoint directory."""
+        return os.path.join(self.pm_dir, f"ckpt_{self._ckpt_gen}")
+
+    def _prev_dir(self):
+        """Previous generation checkpoint (to be replaced)."""
+        return os.path.join(self.pm_dir, f"ckpt_{1 - self._ckpt_gen}")
+
+    @staticmethod
+    def _param_filename(bi, pi):
+        return f"block_{bi}_param_{pi}.bin"
+
+    # ── Core interface ───────────────────────────────────────────────────
+
+    def evict_readonly(self, block_idx, params):
+        """
+        Forward/Backward evict: params not modified.
+        Copy to DRAM buffer for later restore. No PM write.
+        """
+        for pi, p in enumerate(params):
+            self.dram_buffers[block_idx][pi].copy_(p.data)
+
+    def evict_dirty(self, block_idx, params):
+        """
+        Optimizer step evict: params modified.
+        GPU → pinned DRAM (cudaMemcpy D2H) + pwrite to tmp directory.
+        Does NOT fsync or rename — that happens in checkpoint_commit().
+        """
+        t0 = time.perf_counter()
+
+        tmp_dir = self._tmp_dir()
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        for pi, p in enumerate(params):
+            # GPU → pinned DRAM
+            self.dram_buffers[block_idx][pi].copy_(p.data)
+
+            # DRAM → PM tmp file (pwrite, no fsync yet)
+            fpath = os.path.join(tmp_dir, self._param_filename(block_idx, pi))
+            buf = self.dram_buffers[block_idx][pi]
+            with open(fpath, 'wb') as f:
+                f.write(buf.numpy().tobytes())
+
+        torch.cuda.synchronize()
+        self._write_ms.append((time.perf_counter() - t0) * 1e3)
+
+    def checkpoint_commit(self):
+        """
+        Per-checkpoint crash consistency: fsync all files → rename directory.
+
+        Called once after all blocks have been evict_dirty'd.
+        Simulates DeepSpeed checkpoint: the entire checkpoint is atomic.
+
+        Uses alternating generations (ckpt_0 / ckpt_1) so the previous
+        committed checkpoint survives until the new one is fully committed.
+        """
+        t0 = time.perf_counter()
+
+        tmp_dir = self._tmp_dir()
+        new_dir = self._latest_dir()
+
+        # 1. fsync every file in tmp directory
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
+            fd = os.open(fpath, os.O_RDONLY)
+            os.fsync(fd)
+            os.close(fd)
+
+        # 2. fsync the tmp directory itself (directory entries)
+        dir_fd = os.open(tmp_dir, os.O_RDONLY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+
+        # 3. Remove old generation if it exists (to free the name for rename)
+        import shutil
+        if os.path.exists(new_dir):
+            shutil.rmtree(new_dir)
+
+        # 4. Atomic rename: tmp → new generation
+        os.rename(tmp_dir, new_dir)
+
+        # 5. fsync parent directory to persist the rename
+        parent_fd = os.open(self.pm_dir, os.O_RDONLY)
+        os.fsync(parent_fd)
+        os.close(parent_fd)
+
+        # Alternate generation for next checkpoint
+        self._ckpt_gen = 1 - self._ckpt_gen
+
+        self._checkpoint_ms.append((time.perf_counter() - t0) * 1e3)
+
+    def restore(self, block_idx, params):
+        """
+        Restore: pinned DRAM buffer → GPU.
+        Normal operation: DRAM always has latest data (updated by evict_dirty).
+        """
+        t0 = time.perf_counter()
+        for pi, p in enumerate(params):
+            p.data.copy_(self.dram_buffers[block_idx][pi])
+        torch.cuda.synchronize()
+        self._read_ms.append((time.perf_counter() - t0) * 1e3)
+
+    def prefetch(self, block_idx):
+        """No-op: DRAM buffers already have latest data."""
+        pass
+
+    def reset_dram_pool(self):
+        """No-op for baseline (DRAM buffers are persistent)."""
+        pass
+
+    # ── Gradient collection + Adam ───────────────────────────────────────
+
+    def collect_grad(self, block_idx, params):
+        for p, gbuf in zip(params, self.grads[block_idx]):
+            if p.grad is not None:
+                gbuf.copy_(p.grad.float().cpu())
+                p.grad = None
+
+    def adam_step(self):
+        self.step_count += 1
+        t   = self.step_count
+        bc1 = 1.0 - self.beta1 ** t
+        bc2 = 1.0 - self.beta2 ** t
+
+        for i in range(self.num_blocks):
+            for p32, m, v, g in zip(
+                    self.p_fp32[i], self.m[i], self.v[i], self.grads[i]):
+                if not g.any():
+                    continue
+                p32.mul_(1.0 - self.lr * self.wd)
+                m.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
+                v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+                m_hat = m / bc1
+                v_hat = v / bc2
+                p32.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+
+    def sync_weights_to_gpu(self, blocks):
+        for bi, blk in enumerate(blocks):
+            for pi, p in enumerate(blk.parameters()):
+                p32 = self.p_fp32[bi][pi]
+                p.data.copy_(p32.half().to(p.device))
+
+    def zero_grads(self):
+        for i in range(self.num_blocks):
+            for g in self.grads[i]:
+                g.zero_()
+
+    def cleanup(self):
+        """Clean up PM files."""
+        import shutil
+        if os.path.exists(self.pm_dir):
+            shutil.rmtree(self.pm_dir)
+
+    # ── Stats ────────────────────────────────────────────────────────────
+
+    def write_ms_stats(self):
+        a = self._write_ms
+        return (float(np.median(a)), float(np.percentile(a, 95))) if a else (0.0, 0.0)
+
+    def read_ms_stats(self):
+        a = self._read_ms
+        return (float(np.median(a)), float(np.percentile(a, 95))) if a else (0.0, 0.0)
+
+    def checkpoint_ms_stats(self):
+        a = self._checkpoint_ms
+        return (float(np.median(a)), float(np.percentile(a, 95))) if a else (0.0, 0.0)
+
+
+# Backward compatibility alias
+BeaverOffloadManager = BeaverManager

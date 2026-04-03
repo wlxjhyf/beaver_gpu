@@ -2,11 +2,14 @@
 setup.py — Build beaver_ext PyTorch CUDA extension.
 
 Usage (from beaver_torch/ directory):
-    python setup.py build_ext --inplace
+    pip install -e .
 
-CPU two-step write path: no GPU F2FS kernels needed, only beaver_ext.cu
-+ ddio_helper.cpp. Links against libpmem (for pmem_map_file / pmem_memcpy_persist)
-and libpci (for DDIO control via ddio_helper).
+This extension links against src/core/ for Beaver COW infrastructure:
+  - gpm_interface.cu: PM allocation (gpm_init, gpm_alloc)
+  - beaver_cow.cu: COW cache management (beaver_cache_init, beaver_dram_pool_init)
+
+The extension itself (beaver_ext.cu) is a pure glue layer that bridges
+PyTorch tensors to the Beaver COW backend.
 """
 
 import os
@@ -22,17 +25,28 @@ from setuptools import setup
 # ── Paths ──────────────────────────────────────────────────────────────
 PROJ_ROOT  = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 INCLUDE    = os.path.join(PROJ_ROOT, "include")
+SRC_CORE   = os.path.join(PROJ_ROOT, "src", "core")
 TESTS_DIR  = os.path.join(PROJ_ROOT, "tests")
 
 assert os.path.isdir(INCLUDE), f"include dir not found: {INCLUDE}"
+assert os.path.isdir(SRC_CORE), f"src/core dir not found: {SRC_CORE}"
 
-DDIO_HELPER = os.path.join(TESTS_DIR, "ddio_helper.cpp")
+# ── Source files ───────────────────────────────────────────────────────
+# beaver_ext.cu: PyTorch glue layer (this extension)
+# ddio_helper.cpp: DDIO control wrapper
+# gpm_interface.cu: PM allocation (gpm_init, gpm_alloc, gpm_free)
+# beaver_cow.cu: COW cache management (beaver_cache_init, beaver_dram_pool_init)
 SOURCES = [
-    DDIO_HELPER,
     os.path.join(os.path.dirname(__file__), "beaver_ext.cu"),
+    os.path.join(TESTS_DIR, "ddio_helper.cpp"),
+    os.path.join(SRC_CORE, "gpm_interface.cu"),
+    os.path.join(SRC_CORE, "beaver_cow.cu"),
 ]
 
 # ── NVCC flags ─────────────────────────────────────────────────────────
+# -dc: Generate relocatable device code (required for separate compilation)
+# --extended-lambda: Allow __device__ lambdas
+# --expt-relaxed-constexpr: Allow constexpr in device code
 NVCC_FLAGS = [
     "-O3",
     "-use_fast_math",
@@ -40,6 +54,7 @@ NVCC_FLAGS = [
     "-Xcompiler", "-fPIC",
     "--expt-relaxed-constexpr",
     "--extended-lambda",
+    "-dc",  # Relocatable device code for separate compilation
 ]
 
 # ── RPATH ──────────────────────────────────────────────────────────────
@@ -62,12 +77,14 @@ ext = CUDAExtension(
         "cxx":  ["-O3", "-fPIC"],
         "nvcc": NVCC_FLAGS,
     },
+    # Enable device linking for separate compilation
+    dlink=True,
 )
 
 setup(
     name="beaver_ext",
-    version="0.1.0",
-    description="Beaver GPU PM Offload — PyTorch CUDA extension",
+    version="0.2.0",
+    description="Beaver GPU PM Offload — PyTorch CUDA extension (COW backend)",
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.8",
