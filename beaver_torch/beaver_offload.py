@@ -246,33 +246,51 @@ class BeaverManager:
                 gbuf.copy_(p.grad.float().cpu())
                 p.grad = None
 
-    def adam_step(self):
-        """CPU AdamW step across all blocks."""
+    def begin_optimizer_step(self):
+        """Increment step counter once per training iteration before per-layer adam_step_gpu."""
         self.step_count += 1
-        t   = self.step_count
-        bc1 = 1.0 - self.beta1 ** t
-        bc2 = 1.0 - self.beta2 ** t
 
-        for i in range(self.num_blocks):
-            for p32, m, v, g in zip(
-                    self.p_fp32[i], self.m[i], self.v[i], self.grads[i]):
-                if not g.any():
-                    continue
-                p32.mul_(1.0 - self.lr * self.wd)
-                m.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
-                v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
-                m_hat = m / bc1
-                v_hat = v / bc2
-                p32.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+    def adam_step_gpu(self, block_idx, params):
+        """
+        GPU AdamW for one block.
 
-    def sync_weights_to_gpu(self, blocks):
+        Optimizer states (fp32 master, m, v) live on CPU DRAM between steps.
+        For each param, they are temporarily moved to GPU, Adam runs on GPU,
+        then returned to CPU. Updated fp16 params remain on GPU so that the
+        subsequent evict_dirty call writes a GPU-computed result to PM.
+
+        This mirrors the per-shard GPU optimizer behavior in FSDP/ZeRO-3 (no
+        CPU optimizer offload), adapted for single-GPU by loading one block's
+        states at a time due to VRAM constraints.
         """
-        After adam_step, push updated fp32 master weights back to GPU fp16 params.
-        """
-        for bi, blk in enumerate(blocks):
-            for pi, p in enumerate(blk.parameters()):
-                p32 = self.p_fp32[bi][pi]
-                p.data.copy_(p32.half().to(p.device))
+        bc1 = 1.0 - self.beta1 ** self.step_count
+        bc2 = 1.0 - self.beta2 ** self.step_count
+
+        for pi, p in enumerate(params):
+            g_cpu = self.grads[block_idx][pi]
+            if not g_cpu.any():
+                continue
+
+            device = p.device
+            g   = g_cpu.to(device, non_blocking=True)
+            p32 = self.p_fp32[block_idx][pi].to(device, non_blocking=True)
+            m   = self.m[block_idx][pi].to(device, non_blocking=True)
+            v   = self.v[block_idx][pi].to(device, non_blocking=True)
+
+            # AdamW on GPU
+            p32.mul_(1.0 - self.lr * self.wd)
+            m.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
+            v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+            p32.addcdiv_(m / bc1, (v / bc2).sqrt().add_(self.eps), value=-self.lr)
+
+            # fp16 result stays on GPU; evict_dirty will write this to PM
+            p.data.copy_(p32.half())
+
+            # Return optimizer states to CPU DRAM
+            self.p_fp32[block_idx][pi].copy_(p32.cpu())
+            self.m[block_idx][pi].copy_(m.cpu())
+            self.v[block_idx][pi].copy_(v.cpu())
+            del p32, m, v, g
 
     def zero_grads(self):
         for i in range(self.num_blocks):
@@ -399,11 +417,10 @@ class BaselineManager:
 
     def evict_readonly(self, block_idx, params):
         """
-        Forward/Backward evict: params not modified.
-        Copy to DRAM buffer for later restore. No PM write.
+        Forward/Backward evict: params not modified, DRAM buffer already has
+        the correct version from the last evict_dirty. No write needed.
         """
-        for pi, p in enumerate(params):
-            self.dram_buffers[block_idx][pi].copy_(p.data)
+        _ = block_idx, params
 
     def evict_dirty(self, block_idx, params):
         """
@@ -501,29 +518,37 @@ class BaselineManager:
                 gbuf.copy_(p.grad.float().cpu())
                 p.grad = None
 
-    def adam_step(self):
+    def begin_optimizer_step(self):
+        """Increment step counter once per training iteration before per-layer adam_step_gpu."""
         self.step_count += 1
-        t   = self.step_count
-        bc1 = 1.0 - self.beta1 ** t
-        bc2 = 1.0 - self.beta2 ** t
 
-        for i in range(self.num_blocks):
-            for p32, m, v, g in zip(
-                    self.p_fp32[i], self.m[i], self.v[i], self.grads[i]):
-                if not g.any():
-                    continue
-                p32.mul_(1.0 - self.lr * self.wd)
-                m.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
-                v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
-                m_hat = m / bc1
-                v_hat = v / bc2
-                p32.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+    def adam_step_gpu(self, block_idx, params):
+        """GPU AdamW for one block. See BeaverManager.adam_step_gpu for full docstring."""
+        bc1 = 1.0 - self.beta1 ** self.step_count
+        bc2 = 1.0 - self.beta2 ** self.step_count
 
-    def sync_weights_to_gpu(self, blocks):
-        for bi, blk in enumerate(blocks):
-            for pi, p in enumerate(blk.parameters()):
-                p32 = self.p_fp32[bi][pi]
-                p.data.copy_(p32.half().to(p.device))
+        for pi, p in enumerate(params):
+            g_cpu = self.grads[block_idx][pi]
+            if not g_cpu.any():
+                continue
+
+            device = p.device
+            g   = g_cpu.to(device, non_blocking=True)
+            p32 = self.p_fp32[block_idx][pi].to(device, non_blocking=True)
+            m   = self.m[block_idx][pi].to(device, non_blocking=True)
+            v   = self.v[block_idx][pi].to(device, non_blocking=True)
+
+            p32.mul_(1.0 - self.lr * self.wd)
+            m.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
+            v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+            p32.addcdiv_(m / bc1, (v / bc2).sqrt().add_(self.eps), value=-self.lr)
+
+            p.data.copy_(p32.half())
+
+            self.p_fp32[block_idx][pi].copy_(p32.cpu())
+            self.m[block_idx][pi].copy_(m.cpu())
+            self.v[block_idx][pi].copy_(v.cpu())
+            del p32, m, v, g
 
     def zero_grads(self):
         for i in range(self.num_blocks):

@@ -1,0 +1,139 @@
+xujiahao@panda2:~/F2FS/beaver_gpu$ sudo bash scripts/run_e2e_comparison.sh   
+[sudo] password for xujiahao: 
+============================================================
+ E2e Comparison: Beaver PM vs Baseline (DRAM + sync+rename)
+============================================================
+
+--- Preflight: checking PM mounts ---
+  [OK] Beaver PM : /dev/dax1.0 (devdax)
+  [OK] Baseline PM: /mnt/pmem → /dev/pmem0 (opts: rw,relatime,dax=always)
+
+>>> [1/2] Beaver PM (GPU→PM COW + async prefetch)
+------------------------------------------------------------
+=== E2e PM Training Benchmark (Beaver COW) ===
+Model  : GPT-2 XL | batch=6 seq=512 | dtype=torch.float16
+GPU    : NVIDIA GeForce RTX 4090 (23.5 GB)
+Backend: Intel Optane PM via /dev/dax1.0 (Beaver COW)
+
+`torch_dtype` is deprecated! Use `dtype` instead!
+─── Initializing BeaverManager ───
+BeaverManager sizing:
+  blocks            : 48
+  total chunk files : 1152  (max_inodes=1168)
+  total data pages  : 720624 (2.75 GB)
+  DRAM pool         : 720880 pages (2.75 GB pinned)
+ddio: found NVIDIA GPU at 0000:86:00.0 (AD102 [GeForce RTX 4090])
+ddio: DDIO disabled (GPU bus=0x86)
+[beaver_ext] DDIO disabled (GPU bus 0x86)
+[beaver_ext] initialized (Beaver COW backend):
+  max_fds=1168  max_data_pages=720880  dram_pool_pages=720880
+  PM slab: 8.25 GB  DRAM pool: 2.75 GB
+  Creating chunk files on PM FS ...
+  Done.
+  Allocating CPU Adam states ...
+  Done.
+  VRAM after model load : 3.01 GB
+  Initial eviction: GPU params → PM ...
+  Eviction done: 3065 ms total  (63.9 ms/block)
+  Initial prefetch: already done inside evict_dirty (fixed slot mapping)
+  Warmup (2 iters) ...
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+  Measuring 15 iters ...
+    iter  5/15  loss=14.0050  wall=24198ms  VRAM=3.18GB
+    iter 10/15  loss=11.8772  wall=24184ms  VRAM=3.18GB
+    iter 15/15  loss=13.1060  wall=24111ms  VRAM=3.18GB
+
+======================================================================
+E2e PM Results: Per-Layer Beaver PM Offload (GPU → Optane)
+======================================================================
+  Model   : GPT-2 XL (48 blocks, ~58.6 MB/block)
+  Config  : batch=6, seq=512, lr=0.0003, iters=15
+
+  VRAM peak (PM offload)      : 18.98 GB
+
+  Init eviction  (GPU→PM)     : 3065 ms (63.9 ms/block)
+  Init prefetch  (PM→DRAM)    : 0 ms (0.0 ms/block)
+
+  evict_dirty per call (GPU→PM COW) : median 29.4 ms  p95 30.8 ms/block
+  restore per call (DRAM→GPU)       : median 5.6 ms  p95 6.5 ms/block
+
+  Iteration time : median 24248 ms  p95 24650 ms
+
+  Loss first iter : 12.4264
+  Loss last  iter : 13.1060
+  Loss delta      : +0.6796  (not decreasing ✗)
+
+  Param size/block : 58.6 MB
+  PM write BW      : 1996 MB/s (vs raw 3165 MB/s, overhead: 37%)
+  DRAM read BW     : 10429 MB/s (vs raw 5722 MB/s)
+======================================================================
+Results saved → /mnt/data/xujiahao/F2FS/beaver_gpu/scripts/e2e_pm_results.json
+ddio: DDIO enabled (GPU bus=0x86)
+[beaver_ext] DDIO restored (GPU bus 0x86)
+[beaver_ext] cleaned up
+
+>>> [2/2] Baseline (DRAM two-hop + per-checkpoint rename → /mnt/pmem)
+------------------------------------------------------------
+  PM mount OK: /mnt/pmem → /dev/pmem0 (opts: rw,relatime,dax=always)
+=== E2e Baseline Training Benchmark (DRAM + sync+rename → PM) ===
+Model  : GPT-2 XL | batch=6 seq=512 | dtype=torch.float16
+GPU    : NVIDIA GeForce RTX 4090 (23.5 GB)
+Backend: /mnt/pmem (ext4-dax) + per-checkpoint rename
+
+`torch_dtype` is deprecated! Use `dtype` instead!
+--- Initializing BaselineManager ---
+BaselineManager sizing:
+  blocks      : 48
+  total bytes : 2.75 GB
+  PM dir      : /mnt/pmem/baseline
+  Allocating pinned DRAM buffers ...
+  Done.
+  Allocating CPU Adam states ...
+  Done.
+  VRAM after model load : 3.01 GB
+  Initial eviction: GPU params → PM ...
+  Eviction done: 7117 ms total  (148.3 ms/block)
+  Warmup (2 iters) ...
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+  Measuring 15 iters ...
+    iter  5/15  loss=11.4723  wall=28240ms  VRAM=3.18GB
+    iter 10/15  loss=11.8685  wall=30370ms  VRAM=3.18GB
+    iter 15/15  loss=12.2588  wall=30042ms  VRAM=3.18GB
+
+======================================================================
+E2e Baseline Results: DRAM two-hop + per-checkpoint rename → PM
+======================================================================
+  Model   : GPT-2 XL (48 blocks, ~58.6 MB/block)
+  Config  : batch=6, seq=512, lr=0.0003, iters=15
+
+  VRAM peak (baseline offload)      : 18.98 GB
+
+  Init eviction  (GPU→PM)           : 7117 ms (148.3 ms/block)
+
+  evict_dirty per call (GPU→DRAM+pwrite) : median 149.5 ms  p95 160.3 ms/block
+  checkpoint_commit (fsync+rename)        : median 10.4 ms  p95 11.0 ms
+  restore per call (DRAM→GPU)             : median 5.2 ms  p95 6.4 ms/block
+
+  Iteration time : median 28274 ms  p95 30998 ms
+
+  Loss first iter : 14.8027
+  Loss last  iter : 12.2588
+  Loss delta      : -2.5439  (decreasing ✓)
+
+  Param size/block : 58.6 MB
+  Write BW (GPU→DRAM+pwrite) : 392 MB/s per block
+  Read BW  (DRAM→GPU)        : 11248 MB/s per block
+======================================================================
+Results saved → /mnt/data/xujiahao/F2FS/beaver_gpu/scripts/e2e_baseline_results.json
+
+============================================================
+ Summary
+============================================================
+Metric                                      Beaver PM     Baseline    Speedup
+----------------------------------------------------------------------------
+evict_dirty (ms/block)                           29.4        149.5       5.1x
+write total/iter (ms)                            1410         7185       5.1x
+restore (ms/block)                                5.6          5.2      ~same
+Iteration time (ms, median)                     24248        28274       1.2x
+Loss (first)                                  12.4264      14.8027
+Loss (last)                                   13.1060      12.2588
